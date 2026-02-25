@@ -58,22 +58,35 @@ def make_driver(
     driver.implicitly_wait(10)
 
     if cookies:
-        target_url = initial_url or "about:blank"
-        if initial_url:
-            driver.get(initial_url)
-            time.sleep(1)
-
+        # Inject cookies via CDP *before* any navigation.
+        # driver.add_cookie() requires the browser to already be on the
+        # target domain — but the site redirects to a login page (data:,)
+        # before any cookies are set, so add_cookie lands on the wrong
+        # domain and the session is never established.
+        # Network.setCookie has no domain restriction and takes effect
+        # for the very first request.
+        driver.execute_cdp_cmd("Network.enable", {})
         for cookie in cookies:
+            cmd: dict = {
+                "name":   str(cookie.get("name",  "")),
+                "value":  str(cookie.get("value", "")),
+                "domain": str(cookie.get("domain", "")),
+                "path":   str(cookie.get("path",  "/")),
+            }
+            if cookie.get("secure"):
+                cmd["secure"] = True
+            if cookie.get("httpOnly"):
+                cmd["httpOnly"] = True
+            if cookie.get("expiry"):
+                cmd["expires"] = int(cookie["expiry"])
             try:
-                allowed_keys = {"name", "value", "domain", "path", "secure", "httpOnly", "expiry"}
-                clean = {k: v for k, v in cookie.items() if k in allowed_keys}
-                driver.add_cookie(clean)
+                driver.execute_cdp_cmd("Network.setCookie", cmd)
             except Exception as exc:
-                print(f"[WARN] Could not add cookie '{cookie.get('name')}': {exc}")
+                print(f"[WARN] Could not set cookie '{cookie.get('name')}': {exc}")
 
-        if initial_url:
-            driver.refresh()
-            time.sleep(1)
+    if initial_url:
+        driver.get(initial_url)
+        time.sleep(2)
 
     return driver
 

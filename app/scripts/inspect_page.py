@@ -102,6 +102,46 @@ def run(log, excel_path, cookies, params):
             log(f"  [{i+1}] <{el['tag']}> id={el['id']!r}  text={el['txt']!r}")
 
         log("─" * 60)
+
+        inputs = driver.execute_script("""
+            var hits = [];
+            document.querySelectorAll('input[type=text], input:not([type]), textarea').forEach(function(el) {
+                hits.push({
+                    id:          el.id          || '',
+                    name:        el.name        || '',
+                    placeholder: el.placeholder || '',
+                    cls:         el.className   || ''
+                });
+            });
+            return hits.slice(0, 40);
+        """)
+        log(f"[INFO] Text inputs / textareas: {len(inputs)}")
+        for i, el in enumerate(inputs):
+            log(f"  [{i+1}] id={el['id']!r}  name={el['name']!r}  placeholder={el['placeholder']!r}")
+
+        log("─" * 60)
+
+        checkboxes = driver.execute_script("""
+            var hits = [];
+            document.querySelectorAll('input[type=checkbox]').forEach(function(el) {
+                var label = '';
+                if (el.id) {
+                    var lbl = document.querySelector('label[for="' + el.id + '"]');
+                    if (lbl) label = lbl.innerText.trim();
+                }
+                if (!label) {
+                    var p = el.closest('td, div, span, label');
+                    if (p) label = p.innerText.trim().substring(0, 80);
+                }
+                hits.push({id: el.id, name: el.name || '', label: label, checked: el.checked});
+            });
+            return hits.slice(0, 40);
+        """)
+        log(f"[INFO] Checkboxes: {len(checkboxes)}")
+        for i, el in enumerate(checkboxes):
+            log(f"  [{i+1}] id={el['id']!r}  name={el['name']!r}  checked={el['checked']}  label={el['label']!r}")
+
+        log("─" * 60)
         log("[INFO] Done. Review the output above to identify the elements you need.")
 
     finally:
