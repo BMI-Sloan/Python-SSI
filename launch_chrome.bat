@@ -1,6 +1,6 @@
 @echo off
 REM ---- UPDATE THIS after the new Railway app is deployed ----
-set SSI_URL=https://YOUR-NEW-RAILWAY-URL.up.railway.app
+set SSI_URL=https://ssi.up.railway.app
 REM -----------------------------------------------------------
 
 REM ---- VPN credentials --------------------------------------
