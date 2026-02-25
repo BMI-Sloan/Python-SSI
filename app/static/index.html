@@ -718,7 +718,7 @@ document.getElementById('inspectToggle').addEventListener('click', () => {
 // ─────────────────────────────────────────────
 function bridgeUrl(path = '/cookies') {
   const port = document.getElementById('bridgePort').value.trim() || '9223';
-  return `http://127.0.0.1:${port}${path}`;
+  return `http://localhost:${port}${path}`;
 }
 
 async function pingBridge() {
@@ -844,12 +844,10 @@ function setStatus(status) {
 //  Bridge routing — all scripts run locally via
 //  cookie_bridge.py so they have VPN access.
 // ─────────────────────────────────────────────
-const BRIDGE = 'http://localhost:9223';
-
 async function runOnBridge(script, cookies, params, onDone) {
   let jobId;
   try {
-    const res  = await fetch(`${BRIDGE}/run`, {
+    const res  = await fetch(bridgeUrl('/run'), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ script, cookies, params }),
@@ -862,7 +860,7 @@ async function runOnBridge(script, cookies, params, onDone) {
   } catch (e) {
     const msg = e.message || '';
     if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('ERR_CONNECTION')) {
-      appendLog('[ERROR] Cookie bridge is not running. Start launch_chrome.bat first.');
+      appendLog('[ERROR] Cookie bridge is not running. Start launch_chrome.bat or start_bridge.bat.');
     } else {
       appendLog(`[ERROR] Bridge: ${msg}`);
     }
@@ -872,7 +870,7 @@ async function runOnBridge(script, cookies, params, onDone) {
   document.getElementById('jobLabel').textContent = `Running: ${script} (local via bridge)`;
 
   if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
-  const es = new EventSource(`${BRIDGE}/stream/${jobId}`);
+  const es = new EventSource(bridgeUrl(`/stream/${jobId}`));
   activeEventSource = es;
 
   es.onmessage = e => appendLog(e.data);
