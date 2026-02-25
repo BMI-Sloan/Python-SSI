@@ -368,12 +368,22 @@
   <!-- ───────────── SIDEBAR ───────────── -->
   <aside class="sidebar">
 
-    <!-- Script selector -->
+    <!-- Task selector -->
     <div>
-      <div class="section-label">Script</div>
+      <div class="section-label">Task</div>
       <select id="scriptSelect">
-        <option value="">Loading scripts…</option>
+        <option value="">— choose a task —</option>
+        <option value="cancel_po">Cancel</option>
+        <option value="partial_po">Partial</option>
+        <option value="open_po">Open</option>
       </select>
+    </div>
+
+    <!-- PO Numbers (Cancel task only) -->
+    <div id="poPanel" style="display:none">
+      <div class="section-label">PO Numbers <span style="color:var(--muted)">(one per line)</span></div>
+      <textarea id="poInput" placeholder="Enter PO numbers, one per line&#10;e.g.&#10;123456789&#10;9876543210" rows="6"></textarea>
+      <div style="font-size:11px; color:var(--muted); margin-top:4px">Numbers under 10 digits are padded with leading zeros automatically.</div>
     </div>
 
     <!-- Excel upload -->
@@ -485,21 +495,17 @@ function toast(msg, type = 'ok') {
 }
 
 // ─────────────────────────────────────────────
-//  Load script list
+//  Task selector
 // ─────────────────────────────────────────────
-async function loadScripts() {
-  try {
-    const res = await fetch('/api/scripts');
-    const data = await res.json();
-    const sel = document.getElementById('scriptSelect');
-    sel.innerHTML = '<option value="">— choose a script —</option>' +
-      data.scripts.map(s => `<option value="${s}">${s.replace(/_/g,' ')}</option>`).join('');
-    sel.addEventListener('change', () => {
-      document.getElementById('btnRun').disabled = !sel.value;
-    });
-  } catch (e) {
-    toast('Could not load scripts', 'err');
-  }
+function loadScripts() {
+  const sel = document.getElementById('scriptSelect');
+  sel.addEventListener('change', onTaskChange);
+}
+
+function onTaskChange() {
+  const val = document.getElementById('scriptSelect').value;
+  document.getElementById('btnRun').disabled = !val;
+  document.getElementById('poPanel').style.display = (val === 'cancel_po') ? 'block' : 'none';
 }
 
 // ─────────────────────────────────────────────
@@ -729,6 +735,20 @@ document.getElementById('btnRun').addEventListener('click', async () => {
 
   // Build params
   let paramsStr = document.getElementById('paramsInput').value.trim() || '{}';
+
+  // Inject PO numbers into params for the Cancel task
+  if (script === 'cancel_po') {
+    try {
+      const p = JSON.parse(paramsStr);
+      const rawPos = document.getElementById('poInput').value;
+      const poList = rawPos.split('\n')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(n => n.replace(/\D/g, '').padStart(10, '0'));
+      p.po_numbers = poList;
+      paramsStr = JSON.stringify(p);
+    } catch (_) { /* leave paramsStr unchanged if JSON is broken */ }
+  }
 
   const fd = new FormData();
   fd.append('script', script);
