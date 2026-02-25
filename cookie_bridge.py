@@ -99,6 +99,73 @@ def _run_thread(job_id: str, script_name: str, cookies: list, params: dict) -> N
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Fast page-element inspector (no Selenium — plain HTTP + HTML parser)
+#  Works with any URL reachable from this machine (VPN routes included).
+# ─────────────────────────────────────────────────────────────────────────────
+
+from html.parser import HTMLParser as _HTMLParser
+
+
+class _FormElementParser(_HTMLParser):
+    """Extracts interactive element metadata from raw HTML using stdlib only."""
+    _TRACKED = frozenset(("input", "select", "textarea", "button"))
+
+    def __init__(self):
+        super().__init__()
+        self.elements: list = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag not in self._TRACKED:
+            return
+        ad = dict(attrs)
+        el_type = ad.get("type", "").lower()
+        if el_type == "hidden":
+            return
+        self.elements.append({
+            "tag":         tag,
+            "id":          ad.get("id",          ""),
+            "name":        ad.get("name",        ""),
+            "type":        el_type,
+            "placeholder": ad.get("placeholder", ""),
+            "value":       ad.get("value",       "") if el_type != "password" else "",
+        })
+
+    def error(self, message: str) -> None:  # suppress malformed-HTML errors
+        pass
+
+
+def _fetch_page_elements(url: str, cookies: list) -> dict:
+    """GET url with the given session cookies, parse HTML, return element list."""
+    cookie_str = "; ".join(
+        f"{c['name']}={c['value']}"
+        for c in cookies
+        if c.get("name") and c.get("value")
+    )
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent",
+                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    req.add_header("Accept", "text/html,application/xhtml+xml,*/*;q=0.9")
+    if cookie_str:
+        req.add_header("Cookie", cookie_str)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html      = resp.read().decode("utf-8", errors="replace")
+            final_url = resp.url
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "elements": [], "final_url": url}
+
+    parser = _FormElementParser()
+    parser.feed(html)
+    elements = [e for e in parser.elements if e["id"] or e["name"]]
+    return {
+        "success":     True,
+        "final_url":   final_url,
+        "html_length": len(html),
+        "elements":    elements,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  CDP helpers (sync wrappers around websockets)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -235,6 +302,21 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             job_id = _start_local_run(script, cookies if isinstance(cookies, list) else [], params)
             self._send_json({"job_id": job_id})
+        elif self.path in ("/inspect-url", "/inspect-url/"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                self._send_json({"error": f"Invalid JSON: {exc}"}, 400)
+                return
+            url     = str(data.get("url",     "")).strip()
+            cookies = data.get("cookies", [])
+            if not url:
+                self._send_json({"error": "url is required"}, 400)
+                return
+            result = _fetch_page_elements(url, cookies if isinstance(cookies, list) else [])
+            self._send_json(result)
         else:
             self._send_json({"error": "Not found"}, 404)
 

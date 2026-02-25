@@ -541,31 +541,19 @@ document.getElementById('btnInspect').addEventListener('click', async () => {
   const url = getNormalizedUrl();
   if (!url) { toast('Enter a URL first', 'warn'); return; }
 
-  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
   clearLog();
   setStatus('running');
-  document.getElementById('jobLabel').textContent = 'Running: inspect_page';
+  document.getElementById('jobLabel').textContent = 'Inspecting page…';
   document.getElementById('btnInspect').disabled = true;
 
-  // Cookies
-  let cookiesStr = '';
-  const manualEdit = document.getElementById('cookiesInput').value.trim();
-  if (manualEdit) {
-    cookiesStr = manualEdit;
-  } else if (capturedCookies.length) {
-    cookiesStr = JSON.stringify(capturedCookies);
+  let cookies = capturedCookies;
+  if (!cookies.length) {
+    const raw = document.getElementById('cookiesInput').value.trim();
+    try { cookies = raw ? JSON.parse(raw) : []; } catch (_) { cookies = []; }
   }
 
-  const cookies = cookiesStr ? JSON.parse(cookiesStr) : [];
-  const started = await runOnBridge('inspect_page', cookies, { url }, (status) => {
-    document.getElementById('jobLabel').textContent =
-      `${status === 'completed' ? '✓' : '✗'} inspect_page finished`;
-    document.getElementById('btnInspect').disabled = !getNormalizedUrl();
-  });
-  if (!started) {
-    setStatus('failed');
-    document.getElementById('btnInspect').disabled = !getNormalizedUrl();
-  }
+  await _doInspect(url, cookies);
+  document.getElementById('btnInspect').disabled = !getNormalizedUrl();
 });
 
 // ─────────────────────────────────────────────
@@ -647,6 +635,76 @@ function showSheet(idx) {
   document.querySelectorAll('.sheet-content').forEach(t => t.style.display = +t.dataset.idx===idx ? 'block' : 'none');
 }
 
+// ─────────────────────────────────────────────
+//  Page element display (used by Inspect + auto-inspect on capture)
+// ─────────────────────────────────────────────
+function renderPageElements(data) {
+  if (!data.success) {
+    appendLog(`[ERROR] ${data.error}`);
+    return false;
+  }
+  appendLog(`[INFO] Final URL    : ${data.final_url}`);
+  appendLog(`[INFO] HTML size    : ${(data.html_length / 1024).toFixed(1)} KB`);
+  appendLog(`[INFO] Elements found: ${data.elements.length}`);
+  appendLog('─'.repeat(60));
+
+  const skip   = new Set(['checkbox','radio','hidden','submit','button','file']);
+  const inputs = data.elements.filter(e => (e.tag==='input'||e.tag==='textarea') && !skip.has(e.type));
+  const checks = data.elements.filter(e => e.type === 'checkbox');
+  const sels   = data.elements.filter(e => e.tag  === 'select');
+  const btns   = data.elements.filter(e => e.tag  === 'button' || e.type==='submit' || e.type==='button');
+
+  appendLog(`[INFO] Text inputs (${inputs.length}):`);
+  inputs.forEach((e, i) =>
+    appendLog(`  [${i+1}] id=${JSON.stringify(e.id)}  placeholder=${JSON.stringify(e.placeholder)}`)
+  );
+  appendLog('─'.repeat(60));
+  appendLog(`[INFO] Checkboxes (${checks.length}):`);
+  checks.forEach((e, i) =>
+    appendLog(`  [${i+1}] id=${JSON.stringify(e.id)}  name=${JSON.stringify(e.name)}`)
+  );
+  appendLog('─'.repeat(60));
+  appendLog(`[INFO] Selects (${sels.length}):`);
+  sels.forEach((e, i) =>
+    appendLog(`  [${i+1}] id=${JSON.stringify(e.id)}  name=${JSON.stringify(e.name)}`)
+  );
+  appendLog('─'.repeat(60));
+  appendLog(`[INFO] Buttons / submits (${btns.length}):`);
+  btns.forEach((e, i) =>
+    appendLog(`  [${i+1}] id=${JSON.stringify(e.id)}  value=${JSON.stringify(e.value||'')}`)
+  );
+  appendLog('─'.repeat(60));
+  appendLog('[INFO] Done.');
+  return true;
+}
+
+async function _doInspect(url, cookies) {
+  let result;
+  try {
+    const res = await fetch(bridgeUrl('/inspect-url'), {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ url, cookies }),
+      signal:  AbortSignal.timeout(15000),
+    });
+    const text = await res.text();
+    try { result = JSON.parse(text); } catch (_) { result = { success: false, error: text }; }
+  } catch (e) {
+    const msg = e.message || '';
+    if (e.name === 'TimeoutError' || msg.includes('Failed to fetch') || msg.includes('ERR_CONNECTION')) {
+      appendLog('[ERROR] Cookie bridge is not running. Start launch_chrome.bat or start_bridge.bat.');
+    } else {
+      appendLog(`[ERROR] ${msg}`);
+    }
+    setStatus('failed');
+    document.getElementById('jobLabel').textContent = '✗ Inspect failed';
+    return;
+  }
+  const ok = renderPageElements(result);
+  setStatus(ok ? 'completed' : 'failed');
+  document.getElementById('jobLabel').textContent = ok ? '✓ Inspect done' : '✗ Inspect failed';
+}
+
 document.getElementById('inspectToggle').addEventListener('click', () => {
   inspectOpen = !inspectOpen;
   const panel = document.getElementById('inspectPanel');
@@ -703,6 +761,16 @@ document.getElementById('btnCapture').addEventListener('click', async () => {
       document.getElementById('bridgeStatus').textContent = 'online';
       document.getElementById('bridgeStatus').className = 'ok';
       toast(data.message, 'ok');
+
+      // Auto-inspect: if a URL is already in the URL box, inspect it immediately
+      const autoUrl = getNormalizedUrl();
+      if (autoUrl) {
+        clearLog();
+        setStatus('running');
+        appendLog(`[INFO] Auto-inspecting ${autoUrl} with captured cookies…`);
+        document.getElementById('jobLabel').textContent = 'Inspecting page…';
+        await _doInspect(autoUrl, capturedCookies);
+      }
     } else {
       statusEl.textContent = data.message || 'No cookies found';
       statusEl.className = 'cookie-status err';
