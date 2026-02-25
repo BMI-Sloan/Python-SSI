@@ -15,11 +15,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import logging
+import queue
 import sys
+import threading
+import time
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from threading import Thread
 
 logging.basicConfig(
@@ -28,6 +34,68 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("cookie_bridge")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Local script runner
+#  Scripts live in app/scripts/ (same repo).  The bridge adds app/ to
+#  sys.path so scripts can do `from utils.browser import make_driver`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_APP_DIR = Path(__file__).parent / "app"
+
+
+def _ensure_app_path() -> None:
+    app_str = str(_APP_DIR)
+    if app_str not in sys.path:
+        sys.path.insert(0, app_str)
+
+
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+
+
+def _start_local_run(script_name: str, cookies: list, params: dict) -> str:
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "logs": [], "done": False}
+    t = threading.Thread(
+        target=_run_thread,
+        args=(job_id, script_name, cookies, params),
+        daemon=True,
+    )
+    t.start()
+    return job_id
+
+
+def _run_thread(job_id: str, script_name: str, cookies: list, params: dict) -> None:
+    job = _jobs[job_id]
+
+    def _log(msg: str) -> None:
+        with _jobs_lock:
+            job["logs"].append(str(msg))
+
+    try:
+        _ensure_app_path()
+        script_path = _APP_DIR / "scripts" / f"{script_name}.py"
+        if not script_path.exists():
+            raise FileNotFoundError(
+                f"Script '{script_name}' not found at {script_path}. "
+                "Make sure the full Python-SSI repository is present beside cookie_bridge.py."
+            )
+        spec = importlib.util.spec_from_file_location(script_name, script_path)
+        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+
+        _log(f"[INFO] Starting script: {script_name}")
+        module.run(log=_log, excel_path=None, cookies=cookies, params=params)
+        _log("[INFO] Script completed successfully.")
+        job["status"] = "completed"
+    except Exception as exc:
+        _log(f"[ERROR] {exc}")
+        job["status"] = "failed"
+    finally:
+        with _jobs_lock:
+            job["done"] = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,8 +212,61 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(result)
         elif self.path in ("/health", "/"):
             self._send_json({"status": "ok", "cdp_port": self.cdp_port})
+        elif self.path.startswith("/stream/"):
+            job_id = self.path.split("/stream/", 1)[1].split("?")[0]
+            self._stream_job(job_id)
         else:
             self._send_json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        if self.path in ("/run", "/run/"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                self._send_json({"error": f"Invalid JSON: {exc}"}, 400)
+                return
+            script  = str(data.get("script",  "")).strip()
+            cookies = data.get("cookies", [])
+            params  = data.get("params",  {})
+            if not script:
+                self._send_json({"error": "script name is required"}, 400)
+                return
+            job_id = _start_local_run(script, cookies if isinstance(cookies, list) else [], params)
+            self._send_json({"job_id": job_id})
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def _stream_job(self, job_id: str) -> None:
+        if job_id not in _jobs:
+            self._send_json({"error": "job not found"}, 404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type",  "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        sent = 0
+        try:
+            while True:
+                with _jobs_lock:
+                    snapshot = list(_jobs[job_id]["logs"])
+                    done     = _jobs[job_id]["done"]
+                batch = snapshot[sent:]
+                for line in batch:
+                    self.wfile.write(f"data: {line}\n\n".encode())
+                sent += len(batch)
+                if batch:
+                    self.wfile.flush()
+                if done and sent >= len(snapshot):
+                    status = _jobs[job_id]["status"]
+                    self.wfile.write(f"event: done\ndata: {status}\n\n".encode())
+                    self.wfile.flush()
+                    break
+                time.sleep(0.15)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected
 
 
 def make_handler(cdp_port: int):

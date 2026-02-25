@@ -508,7 +508,8 @@ function loadScripts() {
 function onTaskChange() {
   const val = document.getElementById('scriptSelect').value;
   document.getElementById('btnRun').disabled = !val;
-  document.getElementById('poPanel').style.display = (val === 'cancel_po') ? 'block' : 'none';
+  document.getElementById('poPanel').style.display =
+    ['cancel_po', 'partial_po'].includes(val) ? 'block' : 'none';
 }
 
 // ─────────────────────────────────────────────
@@ -555,39 +556,16 @@ document.getElementById('btnInspect').addEventListener('click', async () => {
     cookiesStr = JSON.stringify(capturedCookies);
   }
 
-  const fd = new FormData();
-  fd.append('script',  'inspect_page');
-  fd.append('cookies', cookiesStr);
-  fd.append('params',  JSON.stringify({ url }));
-
-  let jobId;
-  try {
-    const res = await fetch('/api/run', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error(await res.text());
-    jobId = (await res.json()).job_id;
-  } catch (e) {
-    appendLog(`[ERROR] ${e.message}`);
-    setStatus('failed');
-    document.getElementById('btnInspect').disabled = false;
-    return;
-  }
-
-  const es = new EventSource(`/api/stream/${jobId}`);
-  activeEventSource = es;
-  es.onmessage = e => appendLog(e.data);
-  es.addEventListener('done', e => {
-    setStatus(e.data === 'completed' ? 'completed' : 'failed');
+  const cookies = cookiesStr ? JSON.parse(cookiesStr) : [];
+  const started = await runOnBridge('inspect_page', cookies, { url }, (status) => {
     document.getElementById('jobLabel').textContent =
-      `${e.data === 'completed' ? '✓' : '✗'} inspect_page finished`;
+      `${status === 'completed' ? '✓' : '✗'} inspect_page finished`;
     document.getElementById('btnInspect').disabled = !getNormalizedUrl();
-    es.close(); activeEventSource = null;
   });
-  es.onerror = () => {
-    appendLog('[WARN] Stream disconnected.');
+  if (!started) {
     setStatus('failed');
     document.getElementById('btnInspect').disabled = !getNormalizedUrl();
-    es.close(); activeEventSource = null;
-  };
+  }
 });
 
 // ─────────────────────────────────────────────
@@ -619,8 +597,10 @@ async function handleFile(file) {
   try {
     // Upload
     const upRes  = await fetch('/api/upload', { method: 'POST', body: fd });
-    const upData = await upRes.json();
-    if (!upRes.ok) throw new Error(upData.detail || 'Upload failed');
+    const upText = await upRes.text();
+    let upData = {};
+    try { upData = JSON.parse(upText); } catch (_) {}
+    if (!upRes.ok) throw new Error(upData.detail || upText.substring(0, 120) || 'Upload failed');
     uploadedFileId = upData.file_id;
     uploadedSuffix = '.' + file.name.split('.').pop().toLowerCase();
     nameEl.textContent = `✓ ${file.name}`;
@@ -629,8 +609,9 @@ async function handleFile(file) {
     const fd2 = new FormData();
     fd2.append('file', file);
     const inRes  = await fetch('/api/inspect-excel', { method: 'POST', body: fd2 });
-    const inData = await inRes.json();
-    if (inRes.ok) {
+    let inData = null;
+    if (inRes.ok) { try { inData = await inRes.json(); } catch (_) {} }
+    if (inData) {
       inspectData = inData;
       renderInspect(inData);
       document.getElementById('inspectToggle').style.display = 'flex';
@@ -792,6 +773,56 @@ function setStatus(status) {
 }
 
 // ─────────────────────────────────────────────
+//  Bridge routing — all scripts run locally via
+//  cookie_bridge.py so they have VPN access.
+// ─────────────────────────────────────────────
+const BRIDGE = 'http://localhost:9223';
+
+async function runOnBridge(script, cookies, params, onDone) {
+  let jobId;
+  try {
+    const res  = await fetch(`${BRIDGE}/run`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ script, cookies, params }),
+    });
+    const text = await res.text();
+    let data = {};
+    try { data = JSON.parse(text); } catch (_) {}
+    if (!res.ok) throw new Error(data.error || text.substring(0, 120) || 'Bridge error');
+    jobId = data.job_id;
+  } catch (e) {
+    const msg = e.message || '';
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('ERR_CONNECTION')) {
+      appendLog('[ERROR] Cookie bridge is not running. Start launch_chrome.bat first.');
+    } else {
+      appendLog(`[ERROR] Bridge: ${msg}`);
+    }
+    return false;
+  }
+
+  document.getElementById('jobLabel').textContent = `Running: ${script} (local via bridge)`;
+
+  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
+  const es = new EventSource(`${BRIDGE}/stream/${jobId}`);
+  activeEventSource = es;
+
+  es.onmessage = e => appendLog(e.data);
+  es.addEventListener('done', e => {
+    setStatus(e.data === 'completed' ? 'completed' : 'failed');
+    es.close(); activeEventSource = null;
+    if (onDone) onDone(e.data);
+  });
+  es.onerror = () => {
+    appendLog('[WARN] Stream disconnected.');
+    setStatus('failed');
+    es.close(); activeEventSource = null;
+    if (onDone) onDone('failed');
+  };
+  return true;
+}
+
+// ─────────────────────────────────────────────
 //  Run script
 // ─────────────────────────────────────────────
 document.getElementById('btnRun').addEventListener('click', async () => {
@@ -820,8 +851,8 @@ document.getElementById('btnRun').addEventListener('click', async () => {
   const normUrl = getNormalizedUrl();
   if (normUrl) paramsObj.url = normUrl;
 
-  // Inject PO numbers for the Cancel task
-  if (script === 'cancel_po') {
+  // Inject PO numbers for Cancel and Partial tasks
+  if (['cancel_po', 'partial_po'].includes(script)) {
     const rawPos = document.getElementById('poInput').value;
     const poList = rawPos.split('\n')
       .map(s => s.trim())
@@ -832,53 +863,19 @@ document.getElementById('btnRun').addEventListener('click', async () => {
 
   const paramsStr = JSON.stringify(paramsObj);
 
-  const fd = new FormData();
-  fd.append('script', script);
-  if (uploadedFileId) {
-    fd.append('file_id', uploadedFileId);
-    if (uploadedSuffix) fd.append('file_suffix', uploadedSuffix);
-  }
-  fd.append('cookies', cookiesStr);
-  fd.append('params', paramsStr);
+  // Route to local bridge — scripts need VPN access to edw.select-sales.com
+  const cookies = cookiesStr ? JSON.parse(cookiesStr) : [];
+  const params  = JSON.parse(paramsStr);
 
-  let jobId;
-  try {
-    const res  = await fetch('/api/run', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Failed to start job');
-    jobId = data.job_id;
-  } catch (e) {
-    appendLog(`[ERROR] ${e.message}`);
-    setStatus('failed');
-    document.getElementById('btnRun').disabled = false;
-    return;
-  }
-
-  document.getElementById('jobLabel').textContent = `Job: ${jobId.slice(0,8)}… · Script: ${script}`;
-
-  // Stream logs via SSE
-  const es = new EventSource(`/api/stream/${jobId}`);
-  activeEventSource = es;
-
-  es.onmessage = e => { appendLog(e.data); };
-
-  es.addEventListener('done', e => {
-    const status = e.data;
-    setStatus(status);
+  const started = await runOnBridge(script, cookies, params, (status) => {
     document.getElementById('jobLabel').textContent =
-      `${status === 'completed' ? '✓' : '✗'} Job ${jobId.slice(0,8)}… finished · Script: ${script}`;
+      `${status === 'completed' ? '✓' : '✗'} ${script} finished`;
     document.getElementById('btnRun').disabled = false;
-    es.close();
-    activeEventSource = null;
   });
-
-  es.onerror = () => {
-    appendLog('[WARN] Stream disconnected.');
+  if (!started) {
     setStatus('failed');
     document.getElementById('btnRun').disabled = false;
-    es.close();
-    activeEventSource = null;
-  };
+  }
 });
 
 // ─────────────────────────────────────────────
