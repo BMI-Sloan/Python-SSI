@@ -14,13 +14,18 @@ REM -----------------------------------------------------------
 cd /d "%~dp0"
 
 echo [1/4] Disconnecting any existing VPN session...
-%NECLI% disconnect >nul 2>&1
+REM Run disconnect in the background so it can't hang the script.
+REM Wait 8 seconds, then kill any leftover NECLI process.
+start /b "" %NECLI% disconnect >nul 2>&1
+timeout /t 8 /nobreak >nul
+taskkill /F /IM NECLI.exe >nul 2>&1
 
 echo [2/4] Connecting to %VPN_SERVER%...
 %NECLI% connect -s %VPN_SERVER% -u %VPN_USERNAME% -p %VPN_PASSWORD% -d %VPN_DOMAIN%
 
 if %errorlevel% == 0 (
-    echo  VPN connected successfully!
+    echo  VPN connected. Waiting for tunnel to stabilise...
+    timeout /t 6 /nobreak >nul
 ) else (
     echo  VPN connection failed. Continuing anyway...
 )

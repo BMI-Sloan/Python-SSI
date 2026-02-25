@@ -437,6 +437,9 @@
     <div>
       <div class="section-label">URL</div>
       <textarea id="paramsInput" placeholder="https://your-selectsales-url.com/path" rows="2"></textarea>
+      <button class="btn btn-secondary btn-full" id="btnInspect" disabled style="margin-top:6px;font-size:12px;">
+        🔍 Inspect Page
+      </button>
     </div>
 
     <!-- Run button -->
@@ -507,6 +510,85 @@ function onTaskChange() {
   document.getElementById('btnRun').disabled = !val;
   document.getElementById('poPanel').style.display = (val === 'cancel_po') ? 'block' : 'none';
 }
+
+// ─────────────────────────────────────────────
+//  URL box helpers
+// ─────────────────────────────────────────────
+
+/** Return the normalised URL string from the URL box, or '' if empty/invalid. */
+function getNormalizedUrl() {
+  const raw = document.getElementById('paramsInput').value.trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  try {
+    const p = JSON.parse(raw);
+    if (typeof p === 'string' && /^https?:\/\//i.test(p)) return p;
+    if (p && typeof p === 'object' && p.url) return p.url;
+  } catch (_) {}
+  return '';
+}
+
+// Enable/disable Inspect button whenever URL box changes
+document.getElementById('paramsInput').addEventListener('input', () => {
+  document.getElementById('btnInspect').disabled = !getNormalizedUrl();
+});
+
+// ─────────────────────────────────────────────
+//  Inspect Page
+// ─────────────────────────────────────────────
+document.getElementById('btnInspect').addEventListener('click', async () => {
+  const url = getNormalizedUrl();
+  if (!url) { toast('Enter a URL first', 'warn'); return; }
+
+  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
+  clearLog();
+  setStatus('running');
+  document.getElementById('jobLabel').textContent = 'Running: inspect_page';
+  document.getElementById('btnInspect').disabled = true;
+
+  // Cookies
+  let cookiesStr = '';
+  const manualEdit = document.getElementById('cookiesInput').value.trim();
+  if (manualEdit) {
+    cookiesStr = manualEdit;
+  } else if (capturedCookies.length) {
+    cookiesStr = JSON.stringify(capturedCookies);
+  }
+
+  const fd = new FormData();
+  fd.append('script',  'inspect_page');
+  fd.append('cookies', cookiesStr);
+  fd.append('params',  JSON.stringify({ url }));
+
+  let jobId;
+  try {
+    const res = await fetch('/api/run', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    jobId = (await res.json()).job_id;
+  } catch (e) {
+    appendLog(`[ERROR] ${e.message}`);
+    setStatus('failed');
+    document.getElementById('btnInspect').disabled = false;
+    return;
+  }
+
+  const es = new EventSource(`/api/stream/${jobId}`);
+  activeEventSource = es;
+  es.onmessage = e => appendLog(e.data);
+  es.addEventListener('done', e => {
+    setStatus(e.data === 'completed' ? 'completed' : 'failed');
+    document.getElementById('jobLabel').textContent =
+      `${e.data === 'completed' ? '✓' : '✗'} inspect_page finished`;
+    document.getElementById('btnInspect').disabled = !getNormalizedUrl();
+    es.close(); activeEventSource = null;
+  });
+  es.onerror = () => {
+    appendLog('[WARN] Stream disconnected.');
+    setStatus('failed');
+    document.getElementById('btnInspect').disabled = !getNormalizedUrl();
+    es.close(); activeEventSource = null;
+  };
+});
 
 // ─────────────────────────────────────────────
 //  File upload
@@ -733,25 +815,10 @@ document.getElementById('btnRun').addEventListener('click', async () => {
     cookiesStr = JSON.stringify(capturedCookies);
   }
 
-  // Build params — accept a plain URL, a JSON-quoted URL, or a full JSON object
-  const rawParams = document.getElementById('paramsInput').value.trim();
-  let paramsObj = {};
-  if (rawParams) {
-    // Check if it's a plain URL (no JSON wrapping needed)
-    if (/^https?:\/\//i.test(rawParams)) {
-      paramsObj = { url: rawParams };
-    } else {
-      try {
-        const parsed = JSON.parse(rawParams);
-        // json.parse of a quoted URL returns a plain string — wrap it
-        paramsObj = (typeof parsed === 'string') ? { url: parsed } : (parsed || {});
-      } catch (_) {
-        // Unparseable — treat the whole value as a URL if it looks like one,
-        // otherwise pass empty and let the script report the missing URL.
-        paramsObj = {};
-      }
-    }
-  }
+  // Build params using the shared URL normaliser
+  const paramsObj = {};
+  const normUrl = getNormalizedUrl();
+  if (normUrl) paramsObj.url = normUrl;
 
   // Inject PO numbers for the Cancel task
   if (script === 'cancel_po') {
@@ -763,7 +830,7 @@ document.getElementById('btnRun').addEventListener('click', async () => {
     paramsObj.po_numbers = poList;
   }
 
-  let paramsStr = JSON.stringify(paramsObj);
+  const paramsStr = JSON.stringify(paramsObj);
 
   const fd = new FormData();
   fd.append('script', script);
