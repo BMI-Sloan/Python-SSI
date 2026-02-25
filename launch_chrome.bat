@@ -6,7 +6,7 @@ REM -----------------------------------------------------------
 REM ---- VPN credentials --------------------------------------
 set VPN_SERVER=remote.select-sales.com:4433
 set VPN_USERNAME=sspain
-set VPN_PASSWORD=YOUR_VPN_PASSWORD_HERE
+set VPN_PASSWORD=$Uper1014man
 set VPN_DOMAIN=ssi.local
 set NECLI="C:\Program Files (x86)\SonicWall\SSL-VPN\NetExtender\NECLI.exe"
 REM -----------------------------------------------------------
