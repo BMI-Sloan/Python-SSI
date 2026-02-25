@@ -435,8 +435,8 @@
 
     <!-- Extra params -->
     <div>
-      <div class="section-label">Extra Parameters <span style="color:var(--muted)">(JSON)</span></div>
-      <textarea id="paramsInput" placeholder='{"url": "https://example.com"}' rows="3"></textarea>
+      <div class="section-label">URL</div>
+      <textarea id="paramsInput" placeholder="https://your-selectsales-url.com/path" rows="2"></textarea>
     </div>
 
     <!-- Run button -->
@@ -733,22 +733,37 @@ document.getElementById('btnRun').addEventListener('click', async () => {
     cookiesStr = JSON.stringify(capturedCookies);
   }
 
-  // Build params
-  let paramsStr = document.getElementById('paramsInput').value.trim() || '{}';
-
-  // Inject PO numbers into params for the Cancel task
-  if (script === 'cancel_po') {
-    try {
-      const p = JSON.parse(paramsStr);
-      const rawPos = document.getElementById('poInput').value;
-      const poList = rawPos.split('\n')
-        .map(s => s.trim())
-        .filter(Boolean)
-        .map(n => n.replace(/\D/g, '').padStart(10, '0'));
-      p.po_numbers = poList;
-      paramsStr = JSON.stringify(p);
-    } catch (_) { /* leave paramsStr unchanged if JSON is broken */ }
+  // Build params — accept a plain URL, a JSON-quoted URL, or a full JSON object
+  const rawParams = document.getElementById('paramsInput').value.trim();
+  let paramsObj = {};
+  if (rawParams) {
+    // Check if it's a plain URL (no JSON wrapping needed)
+    if (/^https?:\/\//i.test(rawParams)) {
+      paramsObj = { url: rawParams };
+    } else {
+      try {
+        const parsed = JSON.parse(rawParams);
+        // json.parse of a quoted URL returns a plain string — wrap it
+        paramsObj = (typeof parsed === 'string') ? { url: parsed } : (parsed || {});
+      } catch (_) {
+        // Unparseable — treat the whole value as a URL if it looks like one,
+        // otherwise pass empty and let the script report the missing URL.
+        paramsObj = {};
+      }
+    }
   }
+
+  // Inject PO numbers for the Cancel task
+  if (script === 'cancel_po') {
+    const rawPos = document.getElementById('poInput').value;
+    const poList = rawPos.split('\n')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(n => n.replace(/\D/g, '').padStart(10, '0'));
+    paramsObj.po_numbers = poList;
+  }
+
+  let paramsStr = JSON.stringify(paramsObj);
 
   const fd = new FormData();
   fd.append('script', script);
