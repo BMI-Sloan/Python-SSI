@@ -85,6 +85,11 @@ def _run_script_thread(job_id: str, script_name: str, excel_path: Optional[str],
         log_q.put(None)
 
 
+@app.get("/health")
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok", "version": "1.0.0"})
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     html_file = STATIC_DIR / "index.html"

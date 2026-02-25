@@ -178,6 +178,44 @@
     .cookie-status.ok  { color: var(--accent2); }
     .cookie-status.err { color: var(--danger); }
 
+    .info-box {
+      background: rgba(79,142,247,0.07);
+      border: 1px solid rgba(79,142,247,0.2);
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.5;
+    }
+
+    .info-box strong { color: var(--accent); }
+
+    .bridge-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .bridge-row label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+    .bridge-row input {
+      width: 70px;
+      padding: 5px 8px;
+      font-size: 12px;
+    }
+
+    #bridgeStatus {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 20px;
+      font-weight: 600;
+    }
+
+    #bridgeStatus.unknown { background: var(--border); color: var(--muted); }
+    #bridgeStatus.ok      { background: #064e3b; color: var(--accent2); }
+    #bridgeStatus.err     { background: #450a0a; color: var(--danger); }
+
     /* Excel inspector */
     .inspect-toggle {
       display: flex;
@@ -358,8 +396,22 @@
     <!-- Cookies -->
     <div>
       <div class="section-label">Session Cookies</div>
-      <div class="cookie-row">
-        <button class="btn btn-secondary" id="btnCapture" style="flex:1" title="Capture cookies from Chrome (requires Chrome running with --remote-debugging-port=9222)">
+
+      <div class="info-box" style="margin-bottom:8px">
+        Run <strong>launch_chrome.bat</strong> on your PC first — it starts
+        the VPN, Chrome, and <strong>cookie_bridge.py</strong> (port 9223).
+        Then log in to Select Sales, and click Capture below.
+      </div>
+
+      <div class="bridge-row">
+        <label for="bridgePort">Bridge port</label>
+        <input type="text" id="bridgePort" value="9223" />
+        <button class="btn btn-secondary" id="btnPing" style="font-size:11px; padding:5px 10px;">Ping</button>
+        <span id="bridgeStatus" class="unknown">?</span>
+      </div>
+
+      <div class="cookie-row" style="margin-top:8px">
+        <button class="btn btn-secondary" id="btnCapture" style="flex:1">
           🔑 Capture from Chrome
         </button>
         <button class="btn btn-secondary" id="btnClearCookies" title="Clear cookies">✕</button>
@@ -534,24 +586,53 @@ document.getElementById('inspectToggle').addEventListener('click', () => {
 });
 
 // ─────────────────────────────────────────────
-//  Cookie capture
+//  Cookie capture — calls local cookie_bridge.py
+//  directly from the browser (localhost:PORT)
 // ─────────────────────────────────────────────
+function bridgeUrl(path = '/cookies') {
+  const port = document.getElementById('bridgePort').value.trim() || '9223';
+  return `http://127.0.0.1:${port}${path}`;
+}
+
+async function pingBridge() {
+  const el = document.getElementById('bridgeStatus');
+  el.textContent = '…';
+  el.className = 'unknown';
+  try {
+    const res = await fetch(bridgeUrl('/health'), { signal: AbortSignal.timeout(3000) });
+    if (res.ok) {
+      el.textContent = 'online';
+      el.className = 'ok';
+      return true;
+    }
+  } catch (_) { /* fall through */ }
+  el.textContent = 'offline';
+  el.className = 'err';
+  return false;
+}
+
+document.getElementById('btnPing').addEventListener('click', pingBridge);
+
 document.getElementById('btnCapture').addEventListener('click', async () => {
   const btn = document.getElementById('btnCapture');
   btn.disabled = true;
   btn.textContent = '…Capturing';
   const statusEl = document.getElementById('cookieStatus');
-  statusEl.textContent = 'Connecting to Chrome…';
+  statusEl.textContent = 'Connecting to cookie bridge…';
   statusEl.className = 'cookie-status';
 
   try {
-    const res  = await fetch('/api/capture-cookies');
+    const res = await fetch(bridgeUrl('/cookies'), { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) throw new Error(`Bridge returned ${res.status}`);
     const data = await res.json();
+
     if (data.success && data.cookies.length) {
       capturedCookies = data.cookies;
       document.getElementById('cookiesInput').value = JSON.stringify(capturedCookies, null, 2);
       statusEl.textContent = `✓ ${data.cookies.length} cookie(s) captured`;
       statusEl.className = 'cookie-status ok';
+      document.getElementById('bridgeStatus').textContent = 'online';
+      document.getElementById('bridgeStatus').className = 'ok';
       toast(data.message, 'ok');
     } else {
       statusEl.textContent = data.message || 'No cookies found';
@@ -559,9 +640,14 @@ document.getElementById('btnCapture').addEventListener('click', async () => {
       toast(data.message || 'No cookies captured', 'err');
     }
   } catch (e) {
-    statusEl.textContent = 'Capture failed — is the server running?';
+    const isOffline = e.name === 'TimeoutError' || e.name === 'TypeError';
+    statusEl.textContent = isOffline
+      ? 'Bridge offline — run launch_chrome.bat first'
+      : `Capture failed: ${e.message}`;
     statusEl.className = 'cookie-status err';
-    toast('Cookie capture failed', 'err');
+    document.getElementById('bridgeStatus').textContent = 'offline';
+    document.getElementById('bridgeStatus').className = 'err';
+    toast(isOffline ? 'cookie_bridge.py is not running' : 'Cookie capture failed', 'err');
   } finally {
     btn.disabled = false;
     btn.textContent = '🔑 Capture from Chrome';
