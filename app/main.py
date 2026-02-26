@@ -107,6 +107,25 @@ async def list_scripts() -> JSONResponse:
     return JSONResponse({"scripts": sorted(scripts)})
 
 
+@app.get("/api/bundle/{script_name}")
+async def get_script_bundle(script_name: str) -> JSONResponse:
+    """Return the script + all utils as a JSON bundle for the local bridge to execute."""
+    scripts_dir = Path(__file__).parent / "scripts"
+    utils_dir   = Path(__file__).parent / "utils"
+
+    script_path = scripts_dir / f"{script_name}.py"
+    if not script_path.exists() or script_name.startswith("_"):
+        raise HTTPException(status_code=404, detail=f"Script '{script_name}' not found")
+
+    sources: dict[str, str] = {
+        f"scripts/{script_name}.py": script_path.read_text(encoding="utf-8"),
+    }
+    for util_file in utils_dir.glob("*.py"):
+        sources[f"utils/{util_file.name}"] = util_file.read_text(encoding="utf-8")
+
+    return JSONResponse({"script": script_name, "sources": sources})
+
+
 @app.post("/api/upload")
 async def upload_excel(file: UploadFile = File(...)) -> JSONResponse:
     allowed = {".xlsx", ".xls", ".csv"}

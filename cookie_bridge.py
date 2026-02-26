@@ -54,48 +54,96 @@ _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
 
-def _start_local_run(script_name: str, cookies: list, params: dict) -> str:
+def _start_local_run(script_name: str, cookies: list, params: dict,
+                     sources: "dict | None" = None) -> str:
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = {"status": "running", "logs": [], "done": False}
     t = threading.Thread(
         target=_run_thread,
-        args=(job_id, script_name, cookies, params),
+        args=(job_id, script_name, sources, cookies, params),
         daemon=True,
     )
     t.start()
     return job_id
 
 
-def _run_thread(job_id: str, script_name: str, cookies: list, params: dict) -> None:
-    job = _jobs[job_id]
+def _run_thread(job_id: str, script_name: str, sources: "dict | None",
+                cookies: list, params: dict) -> None:
+    """
+    Execute a script either from a Railway-bundled sources dict (preferred)
+    or from the local app/scripts/ directory (legacy fallback).
+
+    When sources is provided the script + utils are written to a temporary
+    directory so the full repository does NOT need to be present locally.
+    """
+    import shutil
+    import tempfile
+
+    job     = _jobs[job_id]
+    tmp_dir = None
 
     def _log(msg: str) -> None:
         with _jobs_lock:
             job["logs"].append(str(msg))
 
     try:
-        _ensure_app_path()
-        script_path = _APP_DIR / "scripts" / f"{script_name}.py"
-        if not script_path.exists():
+        if sources:
+            # ── Bundled path: write sources to a temp dir ──────────────────
+            tmp_dir = Path(tempfile.mkdtemp(prefix="ssi_bridge_"))
+
+            for rel_path, content in sources.items():
+                dest = tmp_dir / rel_path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+
+            # Guarantee utils is a proper package
+            utils_init = tmp_dir / "utils" / "__init__.py"
+            if not utils_init.exists():
+                utils_init.write_text("", encoding="utf-8")
+
+            script_file = tmp_dir / "scripts" / f"{script_name}.py"
+            sys.path.insert(0, str(tmp_dir))
+        else:
+            # ── Legacy path: full repo must be present beside bridge ────────
+            _ensure_app_path()
+            script_file = _APP_DIR / "scripts" / f"{script_name}.py"
+
+        if not script_file.exists():
             raise FileNotFoundError(
-                f"Script '{script_name}' not found at {script_path}. "
-                "Make sure the full Python-SSI repository is present beside cookie_bridge.py."
+                f"Script '{script_name}' not found at {script_file}."
             )
-        spec = importlib.util.spec_from_file_location(script_name, script_path)
-        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+
+        # Use a unique module name so repeated runs don't hit the module cache.
+        mod_name = f"ssi_{script_name}_{job_id[:8]}"
+        spec   = importlib.util.spec_from_file_location(mod_name, script_file)
+        module = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
+        spec.loader.exec_module(module)                  # type: ignore[union-attr]
 
         _log(f"[INFO] Starting script: {script_name}")
         module.run(log=_log, excel_path=None, cookies=cookies, params=params)
         _log("[INFO] Script completed successfully.")
         job["status"] = "completed"
+
     except Exception as exc:
         _log(f"[ERROR] {exc}")
         job["status"] = "failed"
+
     finally:
         with _jobs_lock:
             job["done"] = True
+
+        if tmp_dir is not None:
+            # Remove temp dir from sys.path
+            tmp_str = str(tmp_dir)
+            if tmp_str in sys.path:
+                sys.path.remove(tmp_str)
+            # Evict cached utils modules so next run gets a fresh import
+            stale = [k for k in list(sys.modules) if k.startswith("utils") or k.startswith("ssi_")]
+            for k in stale:
+                sys.modules.pop(k, None)
+            # Delete the temp directory
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,10 +346,16 @@ class _Handler(BaseHTTPRequestHandler):
             script  = str(data.get("script",  "")).strip()
             cookies = data.get("cookies", [])
             params  = data.get("params",  {})
+            sources = data.get("sources", None)   # bundled from Railway
             if not script:
                 self._send_json({"error": "script name is required"}, 400)
                 return
-            job_id = _start_local_run(script, cookies if isinstance(cookies, list) else [], params)
+            job_id = _start_local_run(
+                script,
+                cookies if isinstance(cookies, list) else [],
+                params,
+                sources if isinstance(sources, dict) else None,
+            )
             self._send_json({"job_id": job_id})
         elif self.path in ("/inspect-url", "/inspect-url/"):
             length = int(self.headers.get("Content-Length", 0))

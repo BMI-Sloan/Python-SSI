@@ -845,12 +845,29 @@ function setStatus(status) {
 //  cookie_bridge.py so they have VPN access.
 // ─────────────────────────────────────────────
 async function runOnBridge(script, cookies, params, onDone) {
+  // Step 1: Fetch the script + utils bundle from Railway (same-origin, always reachable).
+  // This means the local machine only needs cookie_bridge.py — not the full repo.
+  appendLog(`[INFO] Fetching script bundle from server…`);
+  let bundle;
+  try {
+    const bundleRes = await fetch(`/api/bundle/${script}`);
+    if (!bundleRes.ok) {
+      const errText = await bundleRes.text();
+      throw new Error(`Server returned ${bundleRes.status}: ${errText.substring(0, 120)}`);
+    }
+    bundle = await bundleRes.json();
+  } catch (e) {
+    appendLog(`[ERROR] Could not fetch script from server: ${e.message}`);
+    return false;
+  }
+
+  // Step 2: Send the bundle + cookies + params to the local bridge for execution.
   let jobId;
   try {
     const res  = await fetch(bridgeUrl('/run'), {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ script, cookies, params }),
+      body:    JSON.stringify({ script, sources: bundle.sources, cookies, params }),
     });
     const text = await res.text();
     let data = {};
