@@ -42,13 +42,18 @@ def _by_id(driver, eid):
 
 
 def find_search_input(driver, override_id=None):
-    """Locate the 'search for' text input on the PO list/search page."""
+    """Locate the keywords filter input on the PO list page."""
     # 1. User-supplied ID override
     el = _by_id(driver, override_id)
     if el:
         return el
 
-    # 2. Input immediately after a label/cell whose text contains 'search for'
+    # 2. Known ID from site inspection
+    el = _by_id(driver, 'POKeywordsFilter_I')
+    if el:
+        return el
+
+    # 3. Input immediately after a label/cell whose text contains 'search for'
     el = _first_visible(driver.find_elements(By.XPATH,
         "//*[contains(translate(normalize-space(text()),"
         "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
@@ -56,13 +61,13 @@ def find_search_input(driver, override_id=None):
     if el:
         return el
 
-    # 3. Any visible text input with a placeholder hinting 'search'
+    # 4. Any visible text input with a placeholder hinting 'search'
     for inp in driver.find_elements(By.XPATH, "//input[@type='text']"):
         ph = (inp.get_attribute('placeholder') or '').lower()
         if 'search' in ph and inp.is_displayed():
             return inp
 
-    # 4. Common DevExpress search input ID patterns
+    # 5. Generic DevExpress search input ID patterns (fallback)
     for sid in ('PCSearchEdit_I', 'SearchEdit_I', 'POSearch_I',
                 'GridSearch_I', 'Search_I', 'SearchBox_I'):
         el = _by_id(driver, sid)
@@ -93,20 +98,27 @@ def find_po_in_results(driver, po_number):
 def find_cancel_checkbox(driver, override_id=None):
     """
     Locate the CANCEL PO checkbox on the PO detail page.
-    Handles both standard HTML checkboxes and DevExpress-rendered ones.
+    The site uses DevExpress: CancelPo_I is the clickable element,
+    CancelPo_S is the hidden state holder.
     """
     # 1. User-supplied ID override
     el = _by_id(driver, override_id)
     if el:
         return el
 
-    # 2. Standard checkbox whose ID contains 'cancel' (case-insensitive via Python)
+    # 2. Known DevExpress checkbox ID from site inspection (CancelPo_I = clickable input)
+    for cid in ('CancelPo_I', 'CancelPo_S'):
+        el = _by_id(driver, cid)
+        if el:
+            return el
+
+    # 3. Any checkbox-type input whose ID contains 'cancel' (case-insensitive)
     for cb in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
         cb_id = (cb.get_attribute('id') or '').lower()
         if 'cancel' in cb_id:
             return cb
 
-    # 3. Find a table row whose text contains 'cancel po', then grab the
+    # 4. Find a table row whose text contains 'cancel po', then grab the
     #    nearest checkbox — handles label-in-same-row layouts
     for row in driver.find_elements(By.XPATH, "//tr"):
         row_text = row.text.lower()
@@ -114,18 +126,10 @@ def find_cancel_checkbox(driver, override_id=None):
             cb = _first_visible(row.find_elements(By.XPATH, ".//input[@type='checkbox']"))
             if cb:
                 return cb
-            # DevExpress checkboxes may be rendered as a div/span with role=checkbox
             cb = _first_visible(row.find_elements(By.XPATH,
                 ".//*[@role='checkbox'] | .//span[contains(@class,'checkbox')]"))
             if cb:
                 return cb
-
-    # 4. Common DevExpress-style ID patterns
-    for cid in ('CancelPO_I', 'CancelOrder_I', 'POCancel_I', 'Cancel_I',
-                'chkCancelPO', 'chkCancel'):
-        el = _by_id(driver, cid)
-        if el:
-            return el
 
     return None
 
@@ -137,31 +141,29 @@ def find_save_button(driver, override_id=None):
     if el:
         return el
 
-    # 2. Input button / submit whose value contains 'save'
+    # 2. Known ID from site inspection
+    el = _by_id(driver, 'EditFormButton_I')
+    if el:
+        return el
+
+    # 3. Input button / submit whose value contains 'save'
     for btn in driver.find_elements(By.XPATH,
             "//input[@type='button' or @type='submit']"):
         val = (btn.get_attribute('value') or '').lower()
         if 'save' in val and btn.is_displayed():
             return btn
 
-    # 3. <button> element whose text contains 'save'
+    # 4. <button> element whose text contains 'save'
     for btn in driver.find_elements(By.XPATH, "//button"):
         if 'save' in btn.text.lower() and btn.is_displayed():
             return btn
 
-    # 4. <a> link whose text is 'save' (DevExpress toolbar links)
+    # 5. <a> link whose text is 'save' (DevExpress toolbar links)
     el = _first_visible(driver.find_elements(By.XPATH,
         "//a[contains(translate(normalize-space(text()),"
         "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'save')]"))
     if el:
         return el
-
-    # 5. Common DevExpress ID patterns
-    for sid in ('SaveButton_I', 'btnSave', 'SaveBtn_I', 'Save_I',
-                'POSave_I', 'SaveChanges_I'):
-        el = _by_id(driver, sid)
-        if el:
-            return el
 
     return None
 
@@ -217,10 +219,23 @@ def _cancel_single_po(driver, log, base_url, po,
             '{"cancel_checkbox_id": "<id>"} to Extra Parameters.'
         )
 
-    if cancel_cb.is_selected():
+    # DevExpress checkboxes sometimes ignore a plain .click(); use JS as fallback.
+    already_checked = False
+    cb_id = cancel_cb.get_attribute('id') or ''
+    cb_val = (cancel_cb.get_attribute('value') or '').lower()
+    # DevExpress stores "T" (true/checked) or "F"/"U" (false/unchecked) in _S element
+    if cancel_cb.get_attribute('type') == 'checkbox':
+        already_checked = cancel_cb.is_selected()
+    else:
+        already_checked = cb_val in ('true', '1', 't', 'checked')
+
+    if already_checked:
         log(f"  [INFO] CANCEL PO checkbox already checked — skipping tick.")
     else:
-        cancel_cb.click()
+        try:
+            cancel_cb.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", cancel_cb)
         log(f"  [INFO] CANCEL PO checkbox ticked.")
     time.sleep(0.5)
 
