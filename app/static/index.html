@@ -333,6 +333,46 @@
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 
+    /* Page element library */
+    .page-entry {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 5px 8px;
+    }
+
+    .page-entry-info { flex: 1; min-width: 0; }
+
+    .page-entry-label {
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .page-entry-meta {
+      font-size: 10px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #addPageForm {
+      margin-top: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+    }
+
     /* Notifications */
     #toast {
       position: fixed;
@@ -440,6 +480,26 @@
       <button class="btn btn-secondary btn-full" id="btnInspect" disabled style="margin-top:6px;font-size:12px;">
         🔍 Inspect Page
       </button>
+    </div>
+
+    <!-- Page element library -->
+    <div>
+      <div class="section-label" style="display:flex; align-items:center; justify-content:space-between;">
+        Page Elements
+        <button class="btn btn-secondary" id="btnAddPage" style="font-size:10px; padding:3px 8px;">+ Add</button>
+      </div>
+      <div id="pageList" style="display:flex; flex-direction:column; gap:4px;"></div>
+      <div id="addPageForm">
+        <input type="text" id="newPageLabel" placeholder='Label  e.g. "PO Edit"' />
+        <input type="text" id="newPageUrl"   placeholder='Base URL  e.g. http://edw.select-sales.com/PO/Edit/' />
+        <div style="font-size:11px; color:var(--muted);">Paste Inspect Page output:</div>
+        <textarea id="newPageInspect" rows="6"
+          placeholder="[INFO] Final URL    : ...&#10;[INFO] Text inputs (4):&#10;  [1] id=&quot;POKeywordsFilter_I&quot;  placeholder=&quot;&quot;&#10;[INFO] Buttons / submits (1):&#10;  [1] id=&quot;EditFormButton_I&quot;  value=&quot;Save&quot;"></textarea>
+        <div style="display:flex; gap:6px;">
+          <button class="btn btn-success"   id="btnSavePage"   style="flex:1; font-size:12px; padding:7px;">Save</button>
+          <button class="btn btn-secondary" id="btnCancelPage" style="font-size:12px; padding:7px;">Cancel</button>
+        </div>
+      </div>
     </div>
 
     <!-- Run button -->
@@ -949,6 +1009,8 @@ document.getElementById('btnRun').addEventListener('click', async () => {
   // Route to local bridge — scripts need VPN access to edw.select-sales.com
   const cookies = cookiesStr ? JSON.parse(cookiesStr) : [];
   const params  = JSON.parse(paramsStr);
+  // Attach saved page element library so scripts can look up IDs without inspect
+  params.page_elements = loadPageLibrary();
 
   const started = await runOnBridge(script, cookies, params, (status) => {
     document.getElementById('jobLabel').textContent =
@@ -976,9 +1038,110 @@ document.getElementById('btnCopy').addEventListener('click', () => {
 });
 
 // ─────────────────────────────────────────────
+//  Page Element Library  (persisted in localStorage)
+// ─────────────────────────────────────────────
+const PAGES_KEY = 'ssi_page_elements';
+
+function loadPageLibrary() {
+  try { return JSON.parse(localStorage.getItem(PAGES_KEY) || '[]'); } catch (_) { return []; }
+}
+
+function savePageLibrary(pages) {
+  localStorage.setItem(PAGES_KEY, JSON.stringify(pages));
+}
+
+/** Parse the raw text from Inspect Page into a flat element list. */
+function parseInspectOutput(text) {
+  const elements = [];
+  let currentType = 'text';
+  for (const line of text.split('\n')) {
+    const hdr = line.match(/\[INFO\]\s+(Text inputs|Checkboxes|Selects|Buttons \/ submits)/);
+    if (hdr) {
+      const h = hdr[1];
+      currentType = h.includes('Checkbox') ? 'checkbox'
+                  : h.includes('Select')   ? 'select'
+                  : h.includes('Button')   ? 'button'
+                  : 'text';
+      continue;
+    }
+    const idMatch = line.match(/id="([^"]+)"/);
+    if (!idMatch) continue;
+    const valMatch = line.match(/value="([^"]*)"/);
+    const phMatch  = line.match(/placeholder="([^"]*)"/);
+    elements.push({
+      id:          idMatch[1],
+      type:        currentType,
+      value:       valMatch ? valMatch[1] : '',
+      placeholder: phMatch  ? phMatch[1]  : '',
+    });
+  }
+  return elements;
+}
+
+function renderPageLibrary() {
+  const pages = loadPageLibrary();
+  const list  = document.getElementById('pageList');
+  if (!pages.length) {
+    list.innerHTML = '<div style="font-size:11px; color:var(--muted); padding:2px 0">No pages saved yet. Click + Add after running Inspect Page.</div>';
+    return;
+  }
+  list.innerHTML = pages.map((p, i) => `
+    <div class="page-entry">
+      <div class="page-entry-info">
+        <div class="page-entry-label">${p.label}</div>
+        <div class="page-entry-meta">${p.url || '(no URL)'} &middot; ${p.elements.length} elements</div>
+      </div>
+      <button onclick="deleteSavedPage(${i})" title="Delete"
+        style="background:none; border:none; color:var(--danger); cursor:pointer; font-size:15px; padding:0 3px; line-height:1;">✕</button>
+    </div>`).join('');
+}
+
+function deleteSavedPage(idx) {
+  const pages = loadPageLibrary();
+  pages.splice(idx, 1);
+  savePageLibrary(pages);
+  renderPageLibrary();
+}
+
+document.getElementById('btnAddPage').addEventListener('click', () => {
+  document.getElementById('addPageForm').style.display = 'flex';
+  document.getElementById('btnAddPage').style.display  = 'none';
+});
+
+document.getElementById('btnCancelPage').addEventListener('click', () => {
+  document.getElementById('addPageForm').style.display = 'none';
+  document.getElementById('btnAddPage').style.display  = '';
+  document.getElementById('newPageLabel').value   = '';
+  document.getElementById('newPageUrl').value     = '';
+  document.getElementById('newPageInspect').value = '';
+});
+
+document.getElementById('btnSavePage').addEventListener('click', () => {
+  const label = document.getElementById('newPageLabel').value.trim();
+  const url   = document.getElementById('newPageUrl').value.trim();
+  const raw   = document.getElementById('newPageInspect').value.trim();
+  if (!label) { toast('Enter a page label', 'err'); return; }
+  const elements = parseInspectOutput(raw);
+  const pages = loadPageLibrary();
+  // Replace if label already exists, otherwise append
+  const existing = pages.findIndex(p => p.label === label);
+  if (existing >= 0) pages[existing] = { label, url, elements };
+  else               pages.push({ label, url, elements });
+  savePageLibrary(pages);
+  renderPageLibrary();
+  document.getElementById('addPageForm').style.display = 'none';
+  document.getElementById('btnAddPage').style.display  = '';
+  document.getElementById('newPageLabel').value   = '';
+  document.getElementById('newPageUrl').value     = '';
+  document.getElementById('newPageInspect').value = '';
+  toast(`Saved "${label}" — ${elements.length} elements`, 'ok');
+});
+
+// ─────────────────────────────────────────────
 //  Init
 // ─────────────────────────────────────────────
 loadScripts();
+renderPageLibrary();
 </script>
 </body>
 </html>

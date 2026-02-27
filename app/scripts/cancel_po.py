@@ -41,6 +41,37 @@ def _by_id(driver, eid):
     return _first_visible(els)
 
 
+def _by_id_any(driver, eid):
+    """Find element by ID without requiring visibility — needed for DevExpress
+    widgets that render their state input as CSS-hidden but still interactable."""
+    if not eid:
+        return None
+    els = driver.find_elements(By.ID, eid)
+    return els[0] if els else None
+
+
+def _find_id_in_elements(elements, *hints):
+    """Return the first element ID from a stored page-library list whose ID
+    contains any of the hint words (case-insensitive)."""
+    for hint in hints:
+        for el in elements:
+            if hint.lower() in el.get('id', '').lower():
+                return el.get('id')
+    return None
+
+
+def _elements_for_url(page_library, url):
+    """Return the stored element list for the saved page whose base URL is the
+    longest prefix match of `url`."""
+    best, best_len = [], 0
+    for page in page_library:
+        base = page.get('url', '').rstrip('/')
+        if base and url.startswith(base) and len(base) > best_len:
+            best = page.get('elements', [])
+            best_len = len(base)
+    return best
+
+
 def find_search_input(driver, override_id=None):
     """Locate the keywords filter input on the PO list page."""
     # 1. User-supplied ID override
@@ -106,9 +137,10 @@ def find_cancel_checkbox(driver, override_id=None):
     if el:
         return el
 
-    # 2. Known DevExpress checkbox ID from site inspection (CancelPo_I = clickable input)
+    # 2. Known DevExpress checkbox IDs — use _by_id_any because DevExpress renders
+    #    the state element as CSS-hidden, so is_displayed() returns False.
     for cid in ('CancelPo_I', 'CancelPo_S'):
-        el = _by_id(driver, cid)
+        el = _by_id_any(driver, cid)
         if el:
             return el
 
@@ -171,8 +203,15 @@ def find_save_button(driver, override_id=None):
 # ── per-PO cancellation logic ────────────────────────────────────────────────
 
 def _cancel_single_po(driver, log, base_url, po,
-                      search_id, cancel_id, save_id):
+                      search_id, cancel_id, save_id, page_library=None):
     """Navigate to the PO list, search for po, open it, cancel it, save."""
+    lib = page_library or []
+
+    # Supplement any missing IDs from the page element library.
+    if lib:
+        list_els = _elements_for_url(lib, base_url)
+        if not search_id:
+            search_id = _find_id_in_elements(list_els, 'keyword', 'search', 'filter') or ''
 
     # ── Navigate back to the PO search page ──────────────────────────────
     log(f"  [INFO] Loading PO search page…")
@@ -208,6 +247,14 @@ def _cancel_single_po(driver, log, base_url, po,
     po_el.click()
     wait_for_page(driver, 3)
     log(f"  [INFO] Detail URL: {driver.current_url}")
+
+    # Supplement cancel/save IDs from page library now that we know the edit URL.
+    if lib:
+        edit_els = _elements_for_url(lib, driver.current_url)
+        if not cancel_id:
+            cancel_id = _find_id_in_elements(edit_els, 'cancelpo', 'cancel') or ''
+        if not save_id:
+            save_id = _find_id_in_elements(edit_els, 'editform', 'save') or ''
 
     # ── Tick the CANCEL PO checkbox ───────────────────────────────────────
     log(f"  [INFO] Locating CANCEL PO checkbox…")
@@ -276,10 +323,11 @@ def run(log, excel_path, cookies, params):
         log("[ERROR] Enter PO numbers in the PO Numbers box in the sidebar.")
         return
 
-    # Optional element-ID overrides
-    search_id = params.get("search_input_id", "")
-    cancel_id = params.get("cancel_checkbox_id", "")
-    save_id   = params.get("save_button_id", "")
+    # Optional element-ID overrides (manual or from page library)
+    search_id    = params.get("search_input_id", "")
+    cancel_id    = params.get("cancel_checkbox_id", "")
+    save_id      = params.get("save_button_id", "")
+    page_library = params.get("page_elements", [])
 
     log(f"[INFO] POs to cancel ({len(po_numbers)}):")
     for n in po_numbers:
@@ -302,7 +350,8 @@ def run(log, excel_path, cookies, params):
             try:
                 _cancel_single_po(
                     driver, log, url, po,
-                    search_id, cancel_id, save_id
+                    search_id, cancel_id, save_id,
+                    page_library=page_library,
                 )
                 success_count += 1
                 log(f"  [SUCCESS] PO {po} cancelled.")
