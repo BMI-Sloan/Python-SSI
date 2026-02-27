@@ -35,6 +35,17 @@ _SAVE       = 'EditFormButton_CD'                # recording step 9
 _WAIT       = 15
 
 
+def _go_to_po_list(driver):
+    """Navigate directly to the PO list and wait for the search input."""
+    driver.get(_PO_LIST)
+    try:
+        WebDriverWait(driver, _WAIT).until(
+            EC.presence_of_element_located((By.ID, _SEARCH))
+        )
+    except TimeoutException:
+        pass   # best effort
+
+
 def _cancel_single_po(driver, log, po, first):
     wait = WebDriverWait(driver, _WAIT)
 
@@ -149,7 +160,21 @@ def run(log, excel_path, cookies, params):
             except Exception as exc:
                 fail_count += 1
                 log(f"  [ERROR] PO {po} — {exc}")
+            finally:
+                # Always reset to PO list after each PO — success or failure.
+                # This guarantees the next PO starts from a clean state.
+                try:
+                    if '/PO/Edit/' in driver.current_url:
+                        log(f"  [INFO] Resetting browser to PO list…")
+                        _go_to_po_list(driver)
+                except Exception:
+                    pass
             log("─" * 60)
+
+        # Final reset so the browser is on the PO list when the script finishes
+        log("[INFO] All done — resetting to PO list.")
+        _go_to_po_list(driver)
+
     finally:
         driver.quit()
         log("[INFO] Browser closed.")

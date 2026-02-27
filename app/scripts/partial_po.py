@@ -1,21 +1,20 @@
 """
-Partial PO — for each PO, sets every product line's ORDERED qty to match
-its SHIPPED qty, then saves.
+Partial PO — for each PO number, opens the PO detail and sets every
+product line's ORDERED qty to match its SHIPPED qty, then saves.
 
 Enter PO numbers in the PO Numbers box in the sidebar.
-No URL or Extra Parameters are needed — the site address is built in.
+No URL or Extra Parameters needed — the site address is built in.
 
 Steps (mirrors the Chrome Recorder recording):
-  1. Navigate to http://edw.select-sales.com/
-  2. Click the POs navigation link
-  3. Type the PO number into #POKeywordsFilter_I and press Enter
-  4. Click the first result row (#POResults_DXDataRow0 td:nth-of-type(3))
-  5. For every product row where ORDERED ≠ SHIPPED:
-       a. Click the ORDERED cell (td:nth-of-type(15) = index 14)
+  1. Navigate to http://edw.select-sales.com/PO
+  2. Type the PO number into #POKeywordsFilter_I and press Enter
+  3. Click the first result row
+  4. For every product row where ORDERED ≠ SHIPPED:
+       a. Click the ORDERED cell (td index 14, confirmed by recording)
        b. Wait for #POProducts_DXEditor13_I to appear
        c. Type the SHIPPED value, press Enter twice
-  6. Click Save (#EditFormButton_CD)
-  7. Repeat from step 3 for the next PO number
+  5. Click Save (#EditFormButton_CD)
+  6. Reset browser to PO list and repeat for the next PO number
 """
 
 import time
@@ -35,36 +34,74 @@ from utils.browser import make_driver
 # ── site constants — confirmed by Chrome Recorder ────────────────────────────
 _HOME        = 'http://edw.select-sales.com/'
 _PO_LIST     = 'http://edw.select-sales.com/PO'
-_POS_NAV     = 'li:nth-of-type(6) > a'
 _SEARCH      = 'POKeywordsFilter_I'
 _ROW0_CELL   = '#POResults_DXDataRow0 > td:nth-of-type(3)'
 _ORDERED_IDX = 14   # td:nth-of-type(15) — confirmed by recording
 _SHIPPED_IDX = 15   # td immediately after ORDERED
-_DX_EDITOR   = 'POProducts_DXEditor13_I'   # editor that appears when ORDERED is clicked
+_DX_EDITOR   = 'POProducts_DXEditor13_I'
 _SAVE        = 'EditFormButton_CD'
 _WAIT        = 15
 
 
-def _partial_single_po(driver, log, po, first):
+def _go_to_po_list(driver):
+    """Navigate directly to the PO list page and wait for the search input."""
+    driver.get(_PO_LIST)
+    try:
+        WebDriverWait(driver, _WAIT).until(
+            EC.presence_of_element_located((By.ID, _SEARCH))
+        )
+    except TimeoutException:
+        pass   # best effort — main loop will catch any real problems
+
+
+def _click_cell(driver, row_id, cell_idx, max_attempts=3):
+    """
+    Re-fetch the row and click the cell at cell_idx.
+    Retries up to max_attempts times to handle DevExpress grid re-renders
+    that cause StaleElementReferenceException.
+    Returns True on success, False if all attempts fail.
+    """
+    for attempt in range(max_attempts):
+        try:
+            row_el = driver.find_element(By.ID, row_id)
+            cells  = row_el.find_elements(By.TAG_NAME, 'td')
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", cells[cell_idx]
+            )
+            cells[cell_idx].click()
+            return True
+        except StaleElementReferenceException:
+            if attempt < max_attempts - 1:
+                time.sleep(0.3)
+        except (NoSuchElementException, IndexError):
+            return False
+    return False
+
+
+def _read_row_values(driver, row_id):
+    """
+    Read ORDERED and SHIPPED text from a row without holding onto element refs.
+    Returns (ordered_text, shipped_text) or (None, None) if row not found.
+    """
+    try:
+        row_el = driver.find_element(By.ID, row_id)
+        cells  = row_el.find_elements(By.TAG_NAME, 'td')
+        if len(cells) <= _SHIPPED_IDX:
+            return None, None
+        ordered = cells[_ORDERED_IDX].text.strip()
+        shipped = cells[_SHIPPED_IDX].text.strip()
+        return ordered, shipped
+    except (NoSuchElementException, StaleElementReferenceException):
+        return None, None
+
+
+def _partial_single_po(driver, log, po):
     wait = WebDriverWait(driver, _WAIT)
 
-    # ── Steps 1-2: navigate to home and click POs (first PO only) ─────────
-    if first:
-        log(f"  [INFO] Navigating to {_HOME}…")
-        driver.get(_HOME)
-        try:
-            nav = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, _POS_NAV)))
-            nav.click()
-            wait.until(EC.url_contains('/PO'))
-        except TimeoutException:
-            raise RuntimeError(
-                "Could not navigate to PO list. "
-                "Check that the session cookie is still valid."
-            )
-    else:
-        driver.get(_PO_LIST)
+    # ── Navigate to PO list ───────────────────────────────────────────────
+    _go_to_po_list(driver)
 
-    # ── Step 3: type PO number and press Enter ────────────────────────────
+    # ── Type PO number and press Enter ────────────────────────────────────
     try:
         search = wait.until(EC.presence_of_element_located((By.ID, _SEARCH)))
     except TimeoutException:
@@ -79,7 +116,7 @@ def _partial_single_po(driver, log, po, first):
     log(f"  [INFO] Typed {po} — pressing Enter…")
     search.send_keys(Keys.RETURN)
 
-    # ── Step 4: click first result ────────────────────────────────────────
+    # ── Click first result row ────────────────────────────────────────────
     try:
         row_cell = wait.until(EC.presence_of_element_located(
             (By.CSS_SELECTOR, _ROW0_CELL)
@@ -96,84 +133,81 @@ def _partial_single_po(driver, log, po, first):
         raise RuntimeError(f"Detail page did not load after {_WAIT}s (URL: {driver.current_url}).")
     log(f"  [INFO] Detail URL: {driver.current_url}")
 
-    # ── Wait for product table to render ─────────────────────────────────
+    # ── Wait for product table ────────────────────────────────────────────
     try:
         wait.until(EC.presence_of_element_located((By.ID, 'POProducts_DXDataRow0')))
     except TimeoutException:
         log(f"  [INFO] No product rows found — nothing to adjust.")
         return
 
-    # ── Step 5: loop every product row, fix ORDERED where it differs ──────
-    changes = 0
-    row_n   = 0
+    # ── Pass 1: read all row values up front (no element refs kept) ───────
+    # Reading text and clicking in the same loop causes stale refs because
+    # DevExpress re-renders after each click. We scan first, then edit.
+    rows_to_edit = []   # list of (row_n, row_id, shipped_text)
+    row_n = 0
 
     while True:
         row_id = f'POProducts_DXDataRow{row_n}'
+        ordered, shipped = _read_row_values(driver, row_id)
 
-        try:
-            row_el = driver.find_element(By.ID, row_id)
-        except NoSuchElementException:
-            break   # no more rows
-
-        cells = row_el.find_elements(By.TAG_NAME, 'td')
-        if len(cells) <= _SHIPPED_IDX:
+        if ordered is None and shipped is None:
+            # Check if row truly doesn't exist vs a read error
+            if not driver.find_elements(By.ID, row_id):
+                break   # no more rows
             row_n += 1
             continue
 
-        ordered_text = cells[_ORDERED_IDX].text.strip()
-        shipped_text = cells[_SHIPPED_IDX].text.strip()
-
-        if not shipped_text:
+        if not shipped:
             log(f"  [SKIP] Row {row_n+1}: SHIPPED is blank")
-            row_n += 1
+        elif ordered == shipped:
+            log(f"  [OK]   Row {row_n+1}: ORDERED={ordered} already matches SHIPPED")
+        else:
+            log(f"  [EDIT] Row {row_n+1}: ORDERED {ordered} → {shipped}")
+            rows_to_edit.append((row_n, row_id, shipped))
+
+        row_n += 1
+
+    if not rows_to_edit:
+        log(f"  [INFO] All ORDERED quantities already match SHIPPED — nothing to save.")
+        return
+
+    # ── Pass 2: click and edit each mismatched cell ───────────────────────
+    changes = 0
+    for row_n, row_id, shipped_text in rows_to_edit:
+
+        # Re-fetch cells fresh and click with retry (handles DevExpress re-renders)
+        clicked = _click_cell(driver, row_id, _ORDERED_IDX)
+        if not clicked:
+            log(f"  [WARN] Row {row_n+1}: could not click ORDERED cell — skipping")
             continue
 
-        if ordered_text == shipped_text:
-            log(f"  [OK]   Row {row_n+1}: ORDERED={ordered_text} already matches SHIPPED")
-            row_n += 1
-            continue
+        time.sleep(0.5)   # DevExpress needs a moment to show the editor
 
-        log(f"  [EDIT] Row {row_n+1}: ORDERED {ordered_text} → {shipped_text}")
-
-        # Click the ORDERED cell — same as recording's td:nth-of-type(15)
-        try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", cells[_ORDERED_IDX]
-            )
-            cells[_ORDERED_IDX].click()
-            time.sleep(0.5)
-        except StaleElementReferenceException:
-            log(f"  [WARN] Row {row_n+1}: row became stale on click — skipping")
-            row_n += 1
-            continue
-
-        # Wait for DevExpress editor to appear (#POProducts_DXEditor13_I)
+        # Wait for the DevExpress editor (#POProducts_DXEditor13_I)
         try:
             editor = wait.until(EC.presence_of_element_located((By.ID, _DX_EDITOR)))
         except TimeoutException:
             log(f"  [WARN] Row {row_n+1}: editor #{_DX_EDITOR} did not appear — skipping")
-            row_n += 1
             continue
 
-        # Type the SHIPPED value, then Enter × 2 (matches the recording exactly)
+        # Type value, Enter × 2 (matches recording exactly)
         editor.send_keys(Keys.CONTROL + 'a')
         editor.send_keys(shipped_text)
         editor.send_keys(Keys.ENTER)
         time.sleep(0.2)
         try:
-            editor.send_keys(Keys.ENTER)
+            editor.send_keys(Keys.ENTER)   # second Enter; editor may already be gone
         except StaleElementReferenceException:
-            pass   # editor dismissed after first Enter — that's fine
+            pass   # that's fine — first Enter committed it
         time.sleep(0.3)
 
         changes += 1
-        row_n += 1
 
     if changes == 0:
-        log(f"  [INFO] All ORDERED quantities already match SHIPPED — nothing to save.")
+        log(f"  [INFO] No edits succeeded — skipping Save.")
         return
 
-    # ── Step 6: click Save ────────────────────────────────────────────────
+    # ── Click Save ────────────────────────────────────────────────────────
     log(f"  [INFO] {changes} row(s) updated — clicking Save…")
     try:
         save = wait.until(EC.element_to_be_clickable((By.ID, _SAVE)))
@@ -185,7 +219,7 @@ def _partial_single_po(driver, log, po, first):
         wait.until(lambda d: '/PO/Edit/' not in d.current_url)
     except TimeoutException:
         pass
-    log(f"  [INFO] Done. URL: {driver.current_url}")
+    log(f"  [INFO] Saved. URL: {driver.current_url}")
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -218,13 +252,27 @@ def run(log, excel_path, cookies, params):
         for i, po in enumerate(po_numbers, 1):
             log(f"[INFO] ({i}/{len(po_numbers)}) Processing PO: {po}")
             try:
-                _partial_single_po(driver, log, po, first=(i == 1))
+                _partial_single_po(driver, log, po)
                 success_count += 1
                 log(f"  [SUCCESS] PO {po} done.")
             except Exception as exc:
                 fail_count += 1
                 log(f"  [ERROR] PO {po} — {exc}")
+            finally:
+                # Always reset to PO list after each PO — success or failure.
+                # This guarantees the next PO starts from a clean state.
+                try:
+                    if '/PO/Edit/' in driver.current_url:
+                        log(f"  [INFO] Resetting browser to PO list…")
+                        _go_to_po_list(driver)
+                except Exception:
+                    pass
             log("─" * 60)
+
+        # Final reset so the browser is on the PO list when the script finishes
+        log("[INFO] All done — resetting to PO list.")
+        _go_to_po_list(driver)
+
     finally:
         driver.quit()
         log("[INFO] Browser closed.")
