@@ -26,12 +26,21 @@ import time
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
-    ElementNotInteractableException,
     StaleElementReferenceException,
+    TimeoutException,
 )
 
-from utils.browser import make_driver, wait_for_page
+from utils.browser import make_driver
+
+# ── element IDs confirmed by Chrome Recorder ─────────────────────────────────
+_SEARCH_INPUT = 'POKeywordsFilter_I'
+_RESULT_CELL  = '#POResults_DXDataRow0 > td:nth-of-type(3)'
+_SAVE_BTN     = 'EditFormButton_CD'
+_DX_EDITOR    = 'POProducts_DXEditor13_I'   # editor that opens for ORDERED column
+_WAIT_SEC     = 15
 
 
 # ── shared element finders (same strategy as cancel_po) ──────────────────────
@@ -248,34 +257,51 @@ def _set_cell_value(driver, cell_el, value):
 
 # ── per-PO logic ──────────────────────────────────────────────────────────────
 
-def _partial_single_po(driver, log, base_url, po, search_id, save_id):
-    # ── Navigate to the PO search page ───────────────────────────────────
-    log(f"  [INFO] Loading PO search page…")
-    driver.get(base_url)
-    wait_for_page(driver, 3)
+def _partial_single_po(driver, log, base_url, po):
+    wait = WebDriverWait(driver, _WAIT_SEC)
 
-    # ── Search for PO ────────────────────────────────────────────────────
-    log(f"  [INFO] Locating 'search for' input…")
-    search_box = _find_search_input(driver, search_id or None)
-    if not search_box:
-        raise RuntimeError(
-            "Could not find the 'search for' input. "
-            "Set search_input_id in Extra Parameters."
+    # ── Navigate to PO list ───────────────────────────────────────────────
+    log(f"  [INFO] Loading {base_url}…")
+    driver.get(base_url)
+
+    # ── Wait for and fill the search input ───────────────────────────────
+    try:
+        search_box = wait.until(
+            EC.presence_of_element_located((By.ID, _SEARCH_INPUT))
         )
+    except TimeoutException:
+        raise RuntimeError(
+            f"Search input #{_SEARCH_INPUT} not found after {_WAIT_SEC}s "
+            f"(current URL: {driver.current_url}). "
+            "The page may not have loaded or the session cookie expired."
+        )
+
     search_box.clear()
     search_box.send_keys(po)
     log(f"  [INFO] Typed {po} — pressing Enter…")
     search_box.send_keys(Keys.RETURN)
-    time.sleep(2)
 
-    # ── Click the PO row in results ───────────────────────────────────────
-    log(f"  [INFO] Scanning results for PO {po}…")
-    po_el = _find_po_in_results(driver, po)
-    if not po_el:
-        raise RuntimeError(f"PO {po} not found in the results grid.")
-    log(f"  [INFO] Found — clicking to open detail…")
-    po_el.click()
-    wait_for_page(driver, 3)
+    # ── Wait for and click the first result row ───────────────────────────
+    try:
+        result_cell = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, _RESULT_CELL))
+        )
+    except TimeoutException:
+        raise RuntimeError(
+            f"PO {po} not found in results grid after {_WAIT_SEC}s. "
+            "Verify the PO number exists on this site."
+        )
+    log(f"  [INFO] Found PO {po} — opening detail page…")
+    result_cell.click()
+
+    # ── Wait for the detail page ──────────────────────────────────────────
+    try:
+        wait.until(EC.url_contains('/PO/Edit/'))
+    except TimeoutException:
+        raise RuntimeError(
+            f"PO detail page did not load after {_WAIT_SEC}s "
+            f"(current URL: {driver.current_url})."
+        )
     log(f"  [INFO] Detail URL: {driver.current_url}")
 
     # ── Scan product rows ─────────────────────────────────────────────────
@@ -284,13 +310,14 @@ def _partial_single_po(driver, log, base_url, po, search_id, save_id):
 
     if not grid.get("found"):
         raise RuntimeError(
-            "Could not find a table with both ORDERED and SHIPPED columns. "
-            "Run Inspect Page on the PO detail URL to see what's on the page."
+            "No product rows found (POProducts_DXDataRow0 not present). "
+            "The detail page may not have loaded correctly."
         )
 
     rows        = grid["rows"]
     ordered_col = grid["ordered_col"]
-    log(f"  [INFO] {len(rows)} product line(s) found")
+    log(f"  [INFO] {len(rows)} product line(s) found "
+        f"(method: {grid.get('method', '?')})")
 
     # ── Edit each line where ORDERED ≠ SHIPPED ────────────────────────────
     changes = 0
@@ -307,85 +334,41 @@ def _partial_single_po(driver, log, base_url, po, search_id, save_id):
             log(f"  [OK]   Line {idx+1}: ORDERED={ordered} already matches SHIPPED")
             continue
 
-        log(f"  [EDIT] Line {idx+1}: ORDERED {ordered} → {shipped} (SHIPPED)")
+        log(f"  [EDIT] Line {idx+1}: ORDERED {ordered} → {shipped}")
 
-        # Re-fetch the cell fresh (stale element guard)
         try:
-            row_el   = None
-            if row["row_id"]:
-                els = driver.find_elements(By.ID, row["row_id"])
-                if els:
-                    row_el = els[0]
+            row_el = driver.find_element(By.ID, row["row_id"])
+            cells  = row_el.find_elements(By.TAG_NAME, "td")
+            if len(cells) <= ordered_col:
+                log(f"  [WARN] Line {idx+1}: row has fewer cells than expected")
+                continue
 
-            if row_el:
-                cells   = row_el.find_elements(By.TAG_NAME, "td")
-                if len(cells) > ordered_col:
-                    ok = _set_cell_value(driver, cells[ordered_col], shipped)
-                else:
-                    ok = False
-            else:
-                # Fallback: use JS to set the value directly
-                ok = driver.execute_script("""
-                    var tables = document.querySelectorAll('table');
-                    var col = arguments[0], ri = arguments[1], val = arguments[2];
-                    for (var t of tables) {
-                        var drows = Array.from(t.querySelectorAll(
-                            'tbody tr, tr')).filter(function(r){
-                                return !r.querySelectorAll('th').length
-                                    && r.querySelectorAll('td').length > col;
-                        });
-                        if (ri < drows.length) {
-                            var cell = drows[ri].querySelectorAll('td')[col];
-                            var inp  = cell.querySelector('input');
-                            if (inp) {
-                                inp.value = val;
-                                inp.dispatchEvent(new Event('input',  {bubbles:true}));
-                                inp.dispatchEvent(new Event('change', {bubbles:true}));
-                                return true;
-                            }
-                            cell.click();
-                            return 'clicked';
-                        }
-                    }
-                    return false;
-                """, ordered_col, idx, shipped)
-
-                if ok == 'clicked':
-                    time.sleep(0.4)
-                    try:
-                        inp = driver.switch_to.active_element
-                        if inp.tag_name.lower() in ('input', 'textarea'):
-                            inp.send_keys(Keys.CONTROL + 'a')
-                            inp.send_keys(str(shipped))
-                            inp.send_keys(Keys.TAB)
-                            ok = True
-                    except Exception:
-                        ok = False
-
+            ok = _set_cell_value(driver, cells[ordered_col], shipped)
             if ok:
                 changes += 1
             else:
-                log(f"  [WARN] Line {idx+1}: could not edit ORDERED cell")
+                log(f"  [WARN] Line {idx+1}: could not open the ORDERED editor")
 
         except StaleElementReferenceException:
-            log(f"  [WARN] Line {idx+1}: page changed mid-edit — re-scan needed")
+            log(f"  [WARN] Line {idx+1}: page changed mid-edit — skipping")
 
     if changes == 0:
-        log(f"  [INFO] No changes made — all ORDERED values already match SHIPPED.")
+        log(f"  [INFO] No changes needed — all ORDERED values already match SHIPPED.")
         return
 
-    # ── Save ──────────────────────────────────────────────────────────────
-    log(f"  [INFO] {changes} line(s) edited — locating Save button…")
-    save_btn = _find_save_button(driver, save_id or None)
-    if not save_btn:
-        raise RuntimeError(
-            "Could not find the Save button. "
-            "Set save_button_id in Extra Parameters."
-        )
+    # ── Click Save ────────────────────────────────────────────────────────
+    log(f"  [INFO] {changes} line(s) edited — clicking Save…")
+    try:
+        save_btn = wait.until(EC.element_to_be_clickable((By.ID, _SAVE_BTN)))
+    except TimeoutException:
+        raise RuntimeError(f"Save button #{_SAVE_BTN} not found after {_WAIT_SEC}s.")
     save_btn.click()
-    log(f"  [INFO] Saved — waiting for page response…")
-    time.sleep(2)
-    log(f"  [INFO] Post-save URL: {driver.current_url}")
+
+    try:
+        wait.until(lambda d: '/PO/Edit/' not in d.current_url)
+    except TimeoutException:
+        pass
+    log(f"  [INFO] Done. Current URL: {driver.current_url}")
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -406,9 +389,6 @@ def run(log, excel_path, cookies, params):
         log("[ERROR] No PO numbers provided. Enter them in the PO Numbers box.")
         return
 
-    search_id = params.get("search_input_id", "")
-    save_id   = params.get("save_button_id",   "")
-
     log(f"[INFO] POs to process ({len(po_numbers)}):")
     for n in po_numbers:
         log(f"  • {n}")
@@ -427,7 +407,7 @@ def run(log, excel_path, cookies, params):
         for i, po in enumerate(po_numbers, 1):
             log(f"[INFO] ({i}/{len(po_numbers)}) Processing PO: {po}")
             try:
-                _partial_single_po(driver, log, url, po, search_id, save_id)
+                _partial_single_po(driver, log, url, po)
                 success_count += 1
                 log(f"  [SUCCESS] PO {po} partial adjustment saved.")
             except Exception as exc:

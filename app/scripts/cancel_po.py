@@ -6,15 +6,10 @@ Numbers shorter than 10 digits are padded with leading zeros by the UI.
 
 Extra Parameters (JSON box in sidebar):
     {
-        "url": "https://your-selectsales-url/path/to/po-search",
-
-        // Optional: override auto-detected element IDs
-        // Run inspect_page on the relevant URL to find the real IDs if
-        // the script cannot locate an element automatically.
-        "search_input_id":    "...",   // 'search for' input on PO list page
-        "cancel_checkbox_id": "...",   // 'CANCEL PO' checkbox on detail page
-        "save_button_id":     "..."    // 'Save' button on detail page
+        "url": "http://edw.select-sales.com/PO"
     }
+
+Element IDs are fixed (confirmed by Chrome Recorder) — no overrides needed.
 """
 
 import time
@@ -25,7 +20,15 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-from utils.browser import make_driver, wait_for_page
+from utils.browser import make_driver
+
+# ── element IDs confirmed by Chrome Recorder ─────────────────────────────────
+# These IDs never change on edw.select-sales.com/PO — no fallback chains needed.
+_SEARCH_INPUT   = 'POKeywordsFilter_I'
+_RESULT_CELL    = '#POResults_DXDataRow0 > td:nth-of-type(3)'
+_CANCEL_CB      = 'CancelPo_S_D'
+_SAVE_BTN       = 'EditFormButton_CD'
+_WAIT_SEC       = 15   # max seconds to wait for any element
 
 
 # ── element discovery helpers ────────────────────────────────────────────────
@@ -206,72 +209,64 @@ def find_save_button(driver, override_id=None):
 
 # ── per-PO cancellation logic ────────────────────────────────────────────────
 
-def _cancel_single_po(driver, log, base_url, po,
-                      search_id, cancel_id, save_id, page_library=None):
+def _cancel_single_po(driver, log, base_url, po):
     """Navigate to the PO list, search for po, open it, cancel it, save."""
-    lib = page_library or []
+    wait = WebDriverWait(driver, _WAIT_SEC)
 
-    # Supplement any missing IDs from the page element library.
-    if lib:
-        list_els = _elements_for_url(lib, base_url)
-        if not search_id:
-            search_id = _find_id_in_elements(list_els, 'keyword', 'search', 'filter') or ''
-
-    # ── Navigate back to the PO search page ──────────────────────────────
-    log(f"  [INFO] Loading PO search page…")
+    # ── Navigate to PO list ───────────────────────────────────────────────
+    log(f"  [INFO] Loading {base_url}…")
     driver.get(base_url)
-    wait_for_page(driver, 3)
 
-    # ── Find the search input ─────────────────────────────────────────────
-    log(f"  [INFO] Locating 'search for' input…")
-    search_box = find_search_input(driver, search_id or None)
-    if not search_box:
+    # ── Wait for and fill the search input ───────────────────────────────
+    try:
+        search_box = wait.until(
+            EC.presence_of_element_located((By.ID, _SEARCH_INPUT))
+        )
+    except TimeoutException:
         raise RuntimeError(
-            "Could not find the 'search for' input box. "
-            "Run inspect_page on this URL, then add "
-            '{"search_input_id": "<id>"} to Extra Parameters.'
+            f"Search input #{_SEARCH_INPUT} not found after {_WAIT_SEC}s "
+            f"(current URL: {driver.current_url}). "
+            "The page may not have loaded or the session cookie expired."
         )
 
     search_box.clear()
     search_box.send_keys(po)
     log(f"  [INFO] Typed {po} — pressing Enter…")
     search_box.send_keys(Keys.RETURN)
-    time.sleep(2)          # let the grid filter/refresh
 
-    # ── Find the PO row in the results grid ───────────────────────────────
-    log(f"  [INFO] Scanning results for PO {po}…")
-    po_el = find_po_in_results(driver, po)
-    if not po_el:
+    # ── Wait for and click the first result row ───────────────────────────
+    try:
+        result_cell = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, _RESULT_CELL))
+        )
+    except TimeoutException:
         raise RuntimeError(
-            f"PO {po} not found in the results grid after searching. "
-            "Verify the PO number exists and is visible on this page."
+            f"PO {po} not found in results grid after {_WAIT_SEC}s. "
+            "Verify the PO number exists on this site."
         )
 
-    log(f"  [INFO] Found PO {po} — clicking to open detail…")
-    po_el.click()
-    wait_for_page(driver, 3)
+    log(f"  [INFO] Found PO {po} — opening detail page…")
+    result_cell.click()
+
+    # ── Wait for the detail page to load ─────────────────────────────────
+    try:
+        wait.until(EC.url_contains('/PO/Edit/'))
+    except TimeoutException:
+        raise RuntimeError(
+            f"PO detail page did not load after {_WAIT_SEC}s "
+            f"(current URL: {driver.current_url})."
+        )
     log(f"  [INFO] Detail URL: {driver.current_url}")
 
-    # Supplement cancel/save IDs from page library now that we know the edit URL.
-    if lib:
-        edit_els = _elements_for_url(lib, driver.current_url)
-        if not cancel_id:
-            cancel_id = _find_id_in_elements(edit_els, 'cancelpo', 'cancel') or ''
-        if not save_id:
-            save_id = _find_id_in_elements(edit_els, 'editform', 'save') or ''
-
     # ── Tick the CANCEL PO checkbox ───────────────────────────────────────
-    # The page has 0 standard HTML checkboxes — DevExpress renders the widget
-    # entirely in JavaScript.  The only static-HTML trace is CancelPo_S (a hidden
-    # state input).  The most reliable approach is the DevExpress client API.
+    # Try the DevExpress JS API first (cleanest approach), then fall back
+    # to clicking the confirmed element #CancelPo_S_D directly.
     log(f"  [INFO] Setting CANCEL PO checkbox…")
-
     js_result = driver.execute_script("""
         try {
-            var col  = ASPxClientControl.GetControlCollection();
-            var ctrl = col.GetByName('CancelPo');
+            var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
             if (!ctrl || typeof ctrl.GetChecked !== 'function')
-                return {ok: false, reason: 'control not in collection'};
+                return {ok: false, reason: 'control not found'};
             var was = ctrl.GetChecked();
             if (!was) ctrl.SetChecked(true);
             return {ok: true, was_checked: was};
@@ -282,49 +277,35 @@ def _cancel_single_po(driver, log, base_url, po,
 
     if isinstance(js_result, dict) and js_result.get('ok'):
         if js_result.get('was_checked'):
-            log("  [INFO] CANCEL PO checkbox was already checked — skipping.")
+            log("  [INFO] Already checked — skipping.")
         else:
-            log("  [INFO] CANCEL PO checkbox set via DevExpress API.")
+            log("  [INFO] Checkbox set via DevExpress API.")
     else:
-        # DevExpress API unavailable — try finding and clicking the element
-        reason = js_result.get('reason', str(js_result)) if isinstance(js_result, dict) else str(js_result)
-        log(f"  [DEBUG] DevExpress API: {reason} — falling back to element click.")
+        reason = (js_result or {}).get('reason', str(js_result))
+        log(f"  [DEBUG] DevExpress API: {reason} — clicking #{_CANCEL_CB} directly.")
+        try:
+            cb = driver.find_element(By.ID, _CANCEL_CB)
+            driver.execute_script("arguments[0].click();", cb)
+            log(f"  [INFO] Clicked #{_CANCEL_CB}.")
+        except Exception as exc:
+            raise RuntimeError(f"Could not click CANCEL PO checkbox #{_CANCEL_CB}: {exc}")
 
-        cancel_cb = find_cancel_checkbox(driver, cancel_id or None)
-        if not cancel_cb:
-            raise RuntimeError(
-                "Could not find the CANCEL PO checkbox. "
-                "The page uses DevExpress and the DevExpress JS API was also "
-                "unavailable. Try running the script with headless=False to debug."
-            )
-
-        cb_val = (cancel_cb.get_attribute('value') or '').lower()
-        already_checked = (cancel_cb.get_attribute('type') == 'checkbox' and cancel_cb.is_selected()) \
-                          or cb_val in ('true', '1', 't', 'checked')
-        if already_checked:
-            log("  [INFO] CANCEL PO checkbox already checked — skipping.")
-        else:
-            try:
-                cancel_cb.click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", cancel_cb)
-            log("  [INFO] CANCEL PO checkbox ticked.")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     # ── Click Save ────────────────────────────────────────────────────────
-    log(f"  [INFO] Locating Save button…")
-    save_btn = find_save_button(driver, save_id or None)
-    if not save_btn:
-        raise RuntimeError(
-            "Could not find the Save button. "
-            "Run inspect_page on the PO detail page, then add "
-            '{"save_button_id": "<id>"} to Extra Parameters.'
-        )
-
+    log(f"  [INFO] Clicking Save…")
+    try:
+        save_btn = wait.until(EC.element_to_be_clickable((By.ID, _SAVE_BTN)))
+    except TimeoutException:
+        raise RuntimeError(f"Save button #{_SAVE_BTN} not found after {_WAIT_SEC}s.")
     save_btn.click()
-    log(f"  [INFO] Save clicked — waiting for page response…")
-    time.sleep(2)
-    log(f"  [INFO] Post-save URL: {driver.current_url}")
+
+    # ── Wait to return to PO list ─────────────────────────────────────────
+    try:
+        wait.until(lambda d: '/PO/Edit/' not in d.current_url)
+    except TimeoutException:
+        pass  # page may be slow but save already fired
+    log(f"  [INFO] Done. Current URL: {driver.current_url}")
 
 
 # ── main entry point ─────────────────────────────────────────────────────────
@@ -348,12 +329,6 @@ def run(log, excel_path, cookies, params):
         log("[ERROR] Enter PO numbers in the PO Numbers box in the sidebar.")
         return
 
-    # Optional element-ID overrides (manual or from page library)
-    search_id    = params.get("search_input_id", "")
-    cancel_id    = params.get("cancel_checkbox_id", "")
-    save_id      = params.get("save_button_id", "")
-    page_library = params.get("page_elements", [])
-
     log(f"[INFO] POs to cancel ({len(po_numbers)}):")
     for n in po_numbers:
         log(f"  • {n}")
@@ -373,11 +348,7 @@ def run(log, excel_path, cookies, params):
         for i, po in enumerate(po_numbers, 1):
             log(f"[INFO] ({i}/{len(po_numbers)}) Processing PO: {po}")
             try:
-                _cancel_single_po(
-                    driver, log, url, po,
-                    search_id, cancel_id, save_id,
-                    page_library=page_library,
-                )
+                _cancel_single_po(driver, log, url, po)
                 success_count += 1
                 log(f"  [SUCCESS] PO {po} cancelled.")
             except Exception as exc:
