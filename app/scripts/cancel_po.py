@@ -99,14 +99,76 @@ def _cancel_single_po(driver, log, po, first):
         raise RuntimeError(f"Detail page did not load after {_WAIT}s (URL: {driver.current_url}).")
     log(f"  [INFO] Detail URL: {driver.current_url}")
 
-    # ── Step 5: click the Cancel PO checkbox ─────────────────────────────
+    # Wait for the Save button — confirms the form is fully loaded before
+    # we attempt to interact with any DevExpress controls on the page.
     try:
-        cb = wait.until(EC.presence_of_element_located((By.ID, _CANCEL_CB)))
-        driver.execute_script("arguments[0].click();", cb)
-        log(f"  [INFO] Clicked #{_CANCEL_CB}.")
+        wait.until(EC.presence_of_element_located((By.ID, _SAVE)))
     except TimeoutException:
-        raise RuntimeError(f"#{_CANCEL_CB} not found after {_WAIT}s.")
+        raise RuntimeError(f"Form did not fully load (#{_SAVE} missing after {_WAIT}s).")
 
+    # ── Step 5: tick the CANCEL PO checkbox ──────────────────────────────
+    # The recording used pierce/#CancelPo_S_D, which means the element may
+    # be inside a Shadow DOM. Selenium's standard find_element() cannot see
+    # into Shadow DOM, so we use three JavaScript strategies in order.
+    log(f"  [INFO] Setting CANCEL PO checkbox…")
+
+    result = driver.execute_script("""
+        // Strategy 1 — DevExpress JS API (works by name, no DOM search needed)
+        try {
+            var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
+            if (ctrl && typeof ctrl.SetChecked === 'function') {
+                if (!ctrl.GetChecked()) ctrl.SetChecked(true);
+                return 'api';
+            }
+        } catch(e) {}
+
+        // Strategy 2 — regular getElementById (fast path for non-shadow DOM)
+        var el = document.getElementById('CancelPo_S_D');
+        if (el) { el.click(); return 'id'; }
+
+        // Strategy 3 — deep search through all shadow roots on the page
+        function deepFind(root) {
+            var found = root.querySelector ? root.querySelector('#CancelPo_S_D') : null;
+            if (found) return found;
+            var nodes = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+            for (var n of nodes) {
+                if (n.shadowRoot) {
+                    var r = deepFind(n.shadowRoot);
+                    if (r) return r;
+                }
+            }
+            return null;
+        }
+        var el2 = deepFind(document);
+        if (el2) { el2.click(); return 'shadow'; }
+
+        // Strategy 4 — find any checkbox near a label whose text is "CANCEL PO"
+        var labels = Array.from(document.querySelectorAll('label, td, th, span, div'));
+        for (var l of labels) {
+            if (l.textContent.trim().toUpperCase() === 'CANCEL PO') {
+                var p = l.parentElement;
+                for (var i = 0; i < 5 && p && p !== document.body; i++) {
+                    var cb = p.querySelector(
+                        'input[type=checkbox], [role=checkbox], [class*=check]'
+                    );
+                    if (cb) { cb.click(); return 'label'; }
+                    p = p.parentElement;
+                }
+            }
+        }
+
+        return 'not_found';
+    """)
+
+    if result == 'not_found':
+        raise RuntimeError(
+            "Could not find the CANCEL PO checkbox via DevExpress API, "
+            "element ID, shadow DOM search, or label text. "
+            "Open the PO manually and use browser Inspect to confirm "
+            "the element still has id='CancelPo_S_D'."
+        )
+
+    log(f"  [INFO] CANCEL PO checkbox set (method: {result}).")
     time.sleep(0.3)
 
     # ── Step 6: click Save ────────────────────────────────────────────────
