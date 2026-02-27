@@ -257,33 +257,54 @@ def _cancel_single_po(driver, log, base_url, po,
             save_id = _find_id_in_elements(edit_els, 'editform', 'save') or ''
 
     # ── Tick the CANCEL PO checkbox ───────────────────────────────────────
-    log(f"  [INFO] Locating CANCEL PO checkbox…")
-    cancel_cb = find_cancel_checkbox(driver, cancel_id or None)
-    if not cancel_cb:
-        raise RuntimeError(
-            "Could not find the CANCEL PO checkbox. "
-            "Run inspect_page on the PO detail page, then add "
-            '{"cancel_checkbox_id": "<id>"} to Extra Parameters.'
-        )
+    # The page has 0 standard HTML checkboxes — DevExpress renders the widget
+    # entirely in JavaScript.  The only static-HTML trace is CancelPo_S (a hidden
+    # state input).  The most reliable approach is the DevExpress client API.
+    log(f"  [INFO] Setting CANCEL PO checkbox…")
 
-    # DevExpress checkboxes sometimes ignore a plain .click(); use JS as fallback.
-    already_checked = False
-    cb_id = cancel_cb.get_attribute('id') or ''
-    cb_val = (cancel_cb.get_attribute('value') or '').lower()
-    # DevExpress stores "T" (true/checked) or "F"/"U" (false/unchecked) in _S element
-    if cancel_cb.get_attribute('type') == 'checkbox':
-        already_checked = cancel_cb.is_selected()
-    else:
-        already_checked = cb_val in ('true', '1', 't', 'checked')
+    js_result = driver.execute_script("""
+        try {
+            var col  = ASPxClientControl.GetControlCollection();
+            var ctrl = col.GetByName('CancelPo');
+            if (!ctrl || typeof ctrl.GetChecked !== 'function')
+                return {ok: false, reason: 'control not in collection'};
+            var was = ctrl.GetChecked();
+            if (!was) ctrl.SetChecked(true);
+            return {ok: true, was_checked: was};
+        } catch(e) {
+            return {ok: false, reason: String(e)};
+        }
+    """)
 
-    if already_checked:
-        log(f"  [INFO] CANCEL PO checkbox already checked — skipping tick.")
+    if isinstance(js_result, dict) and js_result.get('ok'):
+        if js_result.get('was_checked'):
+            log("  [INFO] CANCEL PO checkbox was already checked — skipping.")
+        else:
+            log("  [INFO] CANCEL PO checkbox set via DevExpress API.")
     else:
-        try:
-            cancel_cb.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", cancel_cb)
-        log(f"  [INFO] CANCEL PO checkbox ticked.")
+        # DevExpress API unavailable — try finding and clicking the element
+        reason = js_result.get('reason', str(js_result)) if isinstance(js_result, dict) else str(js_result)
+        log(f"  [DEBUG] DevExpress API: {reason} — falling back to element click.")
+
+        cancel_cb = find_cancel_checkbox(driver, cancel_id or None)
+        if not cancel_cb:
+            raise RuntimeError(
+                "Could not find the CANCEL PO checkbox. "
+                "The page uses DevExpress and the DevExpress JS API was also "
+                "unavailable. Try running the script with headless=False to debug."
+            )
+
+        cb_val = (cancel_cb.get_attribute('value') or '').lower()
+        already_checked = (cancel_cb.get_attribute('type') == 'checkbox' and cancel_cb.is_selected()) \
+                          or cb_val in ('true', '1', 't', 'checked')
+        if already_checked:
+            log("  [INFO] CANCEL PO checkbox already checked — skipping.")
+        else:
+            try:
+                cancel_cb.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", cancel_cb)
+            log("  [INFO] CANCEL PO checkbox ticked.")
     time.sleep(0.5)
 
     # ── Click Save ────────────────────────────────────────────────────────
