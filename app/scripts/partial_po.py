@@ -95,7 +95,9 @@ def _find_save_button(driver, override_id=None):
         "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'save')]"))
     if el:
         return el
-    for sid in ('SaveButton_I', 'btnSave', 'SaveBtn_I', 'Save_I', 'POSave_I'):
+    # EditFormButton_CD confirmed by Chrome recorder; _I kept as fallback.
+    for sid in ('EditFormButton_CD', 'EditFormButton_I',
+                'SaveButton_I', 'btnSave', 'SaveBtn_I', 'Save_I', 'POSave_I'):
         el = _by_id(driver, sid)
         if el:
             return el
@@ -105,8 +107,51 @@ def _find_save_button(driver, override_id=None):
 # ── product grid scanner ──────────────────────────────────────────────────────
 
 _FIND_GRID_JS = """
-// Walk every table on the page and find the one whose header row contains
-// both an ORDERED column and a SHIPPED column.
+// ── Primary: DevExpress row IDs confirmed by Chrome Recorder ─────────────────
+// The recording showed:
+//   ORDERED  = td:nth-of-type(15)  →  index 14 (0-based)
+//   SHIPPED  = td immediately after  →  index 15 (0-based)
+//   Row IDs  = POProducts_DXDataRow0, DXDataRow1, ...
+var ORDERED_IDX = 14;
+var SHIPPED_IDX = 15;
+
+var dxRows = [];
+for (var i = 0; ; i++) {
+    var row = document.getElementById('POProducts_DXDataRow' + i);
+    if (!row) break;
+    var cells = Array.from(row.querySelectorAll('td'));
+    if (cells.length <= Math.max(ORDERED_IDX, SHIPPED_IDX)) { continue; }
+
+    var oCell = cells[ORDERED_IDX];
+    var sCell = cells[SHIPPED_IDX];
+
+    var oInput = oCell ? oCell.querySelector('input[type=text], input:not([type])') : null;
+    var ordered = oInput
+        ? oInput.value.trim().replace(/[^\\d.]/g, '')
+        : (oCell ? oCell.textContent.trim().replace(/[^\\d.]/g, '') : '');
+    var shipped = sCell ? sCell.textContent.trim().replace(/[^\\d.]/g, '') : '';
+
+    dxRows.push({
+        row_idx:         i,
+        row_id:          'POProducts_DXDataRow' + i,
+        ordered_col_idx: ORDERED_IDX,
+        shipped_col_idx: SHIPPED_IDX,
+        ordered_val:     ordered,
+        shipped_val:     shipped,
+        has_input:       !!oInput,
+        input_id:        oInput ? (oInput.id || '') : '',
+    });
+}
+
+if (dxRows.length > 0) {
+    return { found: true, rows: dxRows,
+             ordered_col: ORDERED_IDX, shipped_col: SHIPPED_IDX,
+             method: 'dx_rows' };
+}
+
+// ── Fallback: scan tables for ORDERED / SHIPPED headers ──────────────────────
+// DevExpress splits header and body into separate tables, so we search all
+// tables on the page and use the first one that contains both column names.
 var tables = Array.from(document.querySelectorAll('table'));
 for (var t of tables) {
     var headerCells = Array.from(t.querySelectorAll(
@@ -118,63 +163,72 @@ for (var t of tables) {
     var si = texts.findIndex(function(x){ return x === 'SHIPPED'; });
     if (oi === -1 || si === -1) continue;
 
-    // Found — now collect data rows
     var dataRows = Array.from(t.querySelectorAll('tbody tr, tr')).filter(function(row){
-        // Skip header-only rows
         if (row.querySelectorAll('th').length &&
             !row.querySelectorAll('td').length) return false;
-        var cells = row.querySelectorAll('td');
-        return cells.length > Math.max(oi, si);
+        return row.querySelectorAll('td').length > Math.max(oi, si);
     });
 
     var rows = dataRows.map(function(row, idx) {
         var cells = Array.from(row.querySelectorAll('td'));
         var oCell = cells[oi];
         var sCell = cells[si];
-
-        // Shipped is usually read-only text
         var shipped = sCell ? sCell.textContent.trim().replace(/[^\\d.]/g, '') : '';
-
-        // Ordered may already be an <input> or may become one after a click
         var oInput = oCell ? oCell.querySelector('input[type=text], input:not([type])') : null;
         var ordered = oInput
             ? oInput.value.trim().replace(/[^\\d.]/g, '')
             : (oCell ? oCell.textContent.trim().replace(/[^\\d.]/g, '') : '');
-
         return {
-            row_idx:          idx,
-            row_id:           row.id || '',
-            ordered_col_idx:  oi,
-            shipped_col_idx:  si,
-            ordered_val:      ordered,
-            shipped_val:      shipped,
-            has_input:        !!oInput,
-            input_id:         oInput ? (oInput.id || '') : '',
+            row_idx:         idx,
+            row_id:          row.id || '',
+            ordered_col_idx: oi,
+            shipped_col_idx: si,
+            ordered_val:     ordered,
+            shipped_val:     shipped,
+            has_input:       !!oInput,
+            input_id:        oInput ? (oInput.id || '') : '',
         };
     });
 
-    return { found: true, rows: rows, ordered_col: oi, shipped_col: si };
+    return { found: true, rows: rows, ordered_col: oi, shipped_col: si,
+             method: 'header_scan' };
 }
+
 return { found: false, rows: [], ordered_col: -1, shipped_col: -1 };
 """
 
 
 def _set_cell_value(driver, cell_el, value):
-    """Click into a grid cell and replace its value with *value*."""
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell_el)
-    # Click the cell — for DevExpress this usually reveals an <input>
-    cell_el.click()
-    time.sleep(0.4)
+    """Click into a grid cell and replace its value with *value*.
 
-    # Look for an input that appeared inside the cell (or anywhere focused)
-    inp = _first_visible(cell_el.find_elements(By.XPATH,
-        ".//input[@type='text' or not(@type)]"))
+    The Chrome Recorder confirmed the DevExpress flow:
+      1. Click the ORDERED td  → DevExpress reveals POProducts_DXEditor13_I
+      2. Type the new value
+      3. Press Enter twice  (first Enter commits the cell; second clears
+         any DevExpress confirmation prompt)
+    """
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cell_el)
+    cell_el.click()
+    time.sleep(0.5)   # DevExpress needs a moment to show the editor
+
+    # 1. Try the confirmed DevExpress editor ID first (recorder-verified).
+    inp = None
+    for editor_id in ('POProducts_DXEditor13_I',):
+        els = driver.find_elements(By.ID, editor_id)
+        if els and els[0].is_displayed():
+            inp = els[0]
+            break
+
+    # 2. Look for any input that appeared inside the cell.
     if not inp:
-        # DevExpress sometimes puts the editor outside the cell; grab the focused element
+        inp = _first_visible(cell_el.find_elements(By.XPATH,
+            ".//input[@type='text' or not(@type)]"))
+
+    # 3. DevExpress sometimes places the editor outside the cell; grab focus.
+    if not inp:
         try:
             inp = driver.switch_to.active_element
-            tag = inp.tag_name.lower()
-            if tag not in ('input', 'textarea'):
+            if inp.tag_name.lower() not in ('input', 'textarea'):
                 inp = None
         except Exception:
             inp = None
@@ -184,9 +238,11 @@ def _set_cell_value(driver, cell_el, value):
 
     inp.send_keys(Keys.CONTROL + 'a')
     inp.send_keys(str(value))
-    # Commit the edit with Tab (moves focus to next cell without closing the row)
-    inp.send_keys(Keys.TAB)
+    # Two Enters — confirmed by recorder; first commits, second clears any prompt.
+    inp.send_keys(Keys.ENTER)
     time.sleep(0.2)
+    inp.send_keys(Keys.ENTER)
+    time.sleep(0.3)
     return True
 
 

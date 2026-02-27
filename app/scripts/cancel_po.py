@@ -137,9 +137,11 @@ def find_cancel_checkbox(driver, override_id=None):
     if el:
         return el
 
-    # 2. Known DevExpress checkbox IDs — use _by_id_any because DevExpress renders
-    #    the state element as CSS-hidden, so is_displayed() returns False.
-    for cid in ('CancelPo_I', 'CancelPo_S'):
+    # 2. Known DevExpress checkbox IDs (confirmed by Chrome recorder).
+    #    CancelPo_S_D is the clickable switch element; CancelPo_I / CancelPo_S
+    #    are fallbacks.  Use _by_id_any because DevExpress renders state inputs
+    #    as CSS-hidden, so is_displayed() returns False.
+    for cid in ('CancelPo_S_D', 'CancelPo_I', 'CancelPo_S'):
         el = _by_id_any(driver, cid)
         if el:
             return el
@@ -173,10 +175,12 @@ def find_save_button(driver, override_id=None):
     if el:
         return el
 
-    # 2. Known ID from site inspection
-    el = _by_id(driver, 'EditFormButton_I')
-    if el:
-        return el
+    # 2. Known IDs — EditFormButton_CD confirmed by Chrome recorder; _I kept as
+    #    fallback in case the site variant differs.
+    for bid in ('EditFormButton_CD', 'EditFormButton_I'):
+        el = _by_id(driver, bid)
+        if el:
+            return el
 
     # 3. Input button / submit whose value contains 'save'
     for btn in driver.find_elements(By.XPATH,
