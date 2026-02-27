@@ -133,9 +133,19 @@ def _partial_single_po(driver, log, po):
         raise RuntimeError(f"Detail page did not load after {_WAIT}s (URL: {driver.current_url}).")
     log(f"  [INFO] Detail URL: {driver.current_url}")
 
-    # ── Wait for product table ────────────────────────────────────────────
+    # ── Wait for product table WITH actual data ───────────────────────────
+    # After the URL changes, DevExpress may still be rendering the new page's
+    # grid. We wait until the ORDERED column cell (index 14) in the first row
+    # has real text — that confirms the grid finished loading the new PO's data
+    # and we are not reading stale DOM from the previous page.
     try:
         wait.until(EC.presence_of_element_located((By.ID, 'POProducts_DXDataRow0')))
+        wait.until(lambda d: bool(d.execute_script("""
+            var row = document.getElementById('POProducts_DXDataRow0');
+            if (!row) return false;
+            var cells = row.querySelectorAll('td');
+            return cells.length > 14 && cells[14].textContent.trim() !== '';
+        """)))
     except TimeoutException:
         log(f"  [INFO] No product rows found — nothing to adjust.")
         return
@@ -208,12 +218,59 @@ def _partial_single_po(driver, log, po):
         return
 
     # ── Click Save ────────────────────────────────────────────────────────
+    # The recording used pierce/#EditFormButton_CD, meaning the Save button
+    # may be inside a Shadow DOM. Selenium's .click() fails with "element not
+    # interactable" for Shadow DOM elements, so we use JavaScript instead.
     log(f"  [INFO] {changes} row(s) updated — clicking Save…")
-    try:
-        save = wait.until(EC.element_to_be_clickable((By.ID, _SAVE)))
-        save.click()
-    except TimeoutException:
-        raise RuntimeError(f"#{_SAVE} not found after {_WAIT}s.")
+    save_result = driver.execute_script("""
+        // Strategy 1 — direct getElementById + JS click
+        var el = document.getElementById('EditFormButton_CD');
+        if (el) {
+            el.scrollIntoView({block: 'center'});
+            el.click();
+            return 'id';
+        }
+
+        // Strategy 2 — deep shadow root search
+        function deepFind(root) {
+            var found = root.querySelector ? root.querySelector('#EditFormButton_CD') : null;
+            if (found) return found;
+            var nodes = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+            for (var n of nodes) {
+                if (n.shadowRoot) {
+                    var r = deepFind(n.shadowRoot);
+                    if (r) return r;
+                }
+            }
+            return null;
+        }
+        var el2 = deepFind(document);
+        if (el2) {
+            el2.scrollIntoView({block: 'center'});
+            el2.click();
+            return 'shadow';
+        }
+
+        // Strategy 3 — find by visible "Save" text
+        var candidates = Array.from(document.querySelectorAll(
+            'a, button, input[type=button], input[type=submit]'
+        ));
+        for (var c of candidates) {
+            var text = (c.textContent || c.value || '').trim().toLowerCase();
+            if (text === 'save') {
+                c.scrollIntoView({block: 'center'});
+                c.click();
+                return 'text';
+            }
+        }
+        return 'not_found';
+    """)
+    if save_result == 'not_found':
+        raise RuntimeError(
+            f"Could not find Save button (#{_SAVE}) via element ID, "
+            "shadow DOM search, or text. The form may still be in edit mode."
+        )
+    log(f"  [INFO] Save clicked (method: {save_result}).")
 
     try:
         wait.until(lambda d: '/PO/Edit/' not in d.current_url)
