@@ -27,6 +27,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
     StaleElementReferenceException,
+    ElementNotInteractableException,
 )
 
 from utils.browser import make_driver
@@ -37,7 +38,7 @@ _PO_LIST     = 'http://edw.select-sales.com/PO'
 _SEARCH      = 'POKeywordsFilter_I'
 _ROW0_CELL   = '#POResults_DXDataRow0 > td:nth-of-type(3)'
 _ORDERED_IDX = 14   # td:nth-of-type(15) — confirmed by recording
-_SHIPPED_IDX = 15   # td immediately after ORDERED
+_SHIPPED_IDX = 16   # td[15] = OPEN; SHIPPED is one further at td[16]
 _DX_EDITOR   = 'POProducts_DXEditor13_I'
 _SAVE        = 'EditFormButton_CD'
 _WAIT        = 15
@@ -65,10 +66,14 @@ def _click_cell(driver, row_id, cell_idx, max_attempts=3):
         try:
             row_el = driver.find_element(By.ID, row_id)
             cells  = row_el.find_elements(By.TAG_NAME, 'td')
+            cell   = cells[cell_idx]
             driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", cells[cell_idx]
+                "arguments[0].scrollIntoView({block:'center'});", cell
             )
-            cells[cell_idx].click()
+            try:
+                cell.click()
+            except ElementNotInteractableException:
+                driver.execute_script("arguments[0].click();", cell)
             return True
         except StaleElementReferenceException:
             if attempt < max_attempts - 1:
@@ -149,6 +154,23 @@ def _partial_single_po(driver, log, po):
     except TimeoutException:
         log(f"  [INFO] No product rows found — nothing to adjust.")
         return
+
+    # ── Diagnostic: dump td[10..19] of first row to confirm column layout ─
+    try:
+        diag = driver.execute_script("""
+            var row = document.getElementById('POProducts_DXDataRow0');
+            if (!row) return null;
+            var cells = row.querySelectorAll('td');
+            var out = [];
+            for (var i = 10; i < Math.min(20, cells.length); i++) {
+                out.push(i + ':' + cells[i].textContent.trim());
+            }
+            return out.join(' | ');
+        """)
+        if diag:
+            log(f"  [DIAG] Row 0 td[10-19]: {diag}")
+    except Exception:
+        pass
 
     # ── Pass 1: read all row values up front (no element refs kept) ───────
     # Reading text and clicking in the same loop causes stale refs because
