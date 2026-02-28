@@ -121,13 +121,19 @@ def _discover_columns(driver, log):
 
 
 def _read_row_values(driver, row_id, ordered_idx, shipped_idx):
-    """Return (ordered_text, shipped_text) for a row, or (None, None) on error."""
+    """Return (ordered_text, shipped_text) for a row, or (None, None) on error.
+    A blank SHIPPED cell means 0 units shipped — normalised to '0'."""
     try:
         row_el = driver.find_element(By.ID, row_id)
         cells  = row_el.find_elements(By.TAG_NAME, 'td')
         if len(cells) <= max(ordered_idx, shipped_idx):
             return None, None
-        return cells[ordered_idx].text.strip(), cells[shipped_idx].text.strip()
+        ordered = cells[ordered_idx].text.strip()
+        shipped = cells[shipped_idx].text.strip()
+        # Site leaves the SHIPPED cell blank instead of showing 0
+        if not shipped:
+            shipped = '0'
+        return ordered, shipped
     except (NoSuchElementException, StaleElementReferenceException):
         return None, None
 
@@ -327,9 +333,7 @@ def _partial_single_po(driver, log, po):
             row_n += 1
             continue
 
-        if not shipped:
-            log(f"  [SKIP] Row {row_n+1}: SHIPPED is blank")
-        elif ordered == shipped:
+        if ordered == shipped:
             log(f"  [OK]   Row {row_n+1}: ORDERED={ordered} already matches SHIPPED={shipped}")
         else:
             log(f"  [EDIT] Row {row_n+1}: ORDERED {ordered} → {shipped}")
