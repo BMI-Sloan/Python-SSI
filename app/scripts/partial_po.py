@@ -177,11 +177,22 @@ def _set_editor_value(driver, value, log, row_label):
     # trusted keyboard events that DevExpress's change handler will accept.
     try:
         active = driver.switch_to.active_element
+        active_id  = active.get_attribute('id')  or '(no id)'
+        active_tag = active.tag_name
+        log(f"  [DIAG] {row_label}: active element = <{active_tag} id='{active_id}'>")
         active.send_keys(Keys.CONTROL + 'a')   # select all existing text
         active.send_keys(str(value))            # type new value
         # TAB via ActionChains = trusted blur/change on the editor input,
         # which is what DevExpress requires to persist the value.
         ActionChains(driver).send_keys(Keys.TAB).perform()
+        log(f"  [DIAG] {row_label}: typed '{value}' + TAB — checking editor value…")
+        # Brief pause then log what value the editor now shows (before commit)
+        time.sleep(0.1)
+        post_val = driver.execute_script(
+            "var e = document.querySelector(arguments[0]); return e ? e.value : null;",
+            _EDITOR_SEL
+        )
+        log(f"  [DIAG] {row_label}: editor value after typing = {post_val!r}")
         return True
     except Exception as e:
         log(f"  [WARN] {row_label}: trusted typing failed ({type(e).__name__}): {e}")
@@ -345,6 +356,15 @@ def _partial_single_po(driver, log, po):
 
         time.sleep(0.5)   # give DevExpress time to open the inline editor
 
+        # Diagnostic: confirm whether the inline editor actually appeared.
+        # If this always shows NOT OPEN, the cell click is not triggering
+        # DevExpress to open an editor (wrong cell, wrong click type, etc.)
+        editors_now = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
+        if editors_now:
+            log(f"  [DIAG] Row {row_n+1}: editor OPEN — id={editors_now[0].get_attribute('id')}")
+        else:
+            log(f"  [DIAG] Row {row_n+1}: editor NOT OPEN after click — will wait up to {_WAIT}s")
+
         ok = _set_editor_value(driver, shipped_text, log, f"Row {row_n+1}")
         if not ok:
             continue
@@ -460,9 +480,12 @@ def run(log, excel_path, cookies, params):
         log(f"  • {n}")
     log("─" * 60)
 
-    log("[INFO] Starting browser…")
+    # Set show_browser=true in Extra Parameters to watch the browser live.
+    # Useful for debugging when edits appear to succeed but nothing changes.
+    headless = not str(params.get('show_browser', '')).lower() in ('true', '1', 'yes')
+    log(f"[INFO] Starting browser {'(headless)' if headless else '(VISIBLE — debug mode)'}…")
     try:
-        driver = make_driver(cookies=cookies, headless=True, initial_url=_HOME)
+        driver = make_driver(cookies=cookies, headless=headless, initial_url=_HOME)
     except Exception as exc:
         log(f"[ERROR] Browser failed to start: {exc}")
         return
