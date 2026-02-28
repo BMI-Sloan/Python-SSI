@@ -147,9 +147,9 @@ def _set_editor_value(driver, value, log, row_label):
         )
         editor.send_keys(Keys.CONTROL + 'a')
         editor.send_keys(str(value))
-        # Blur via JS to trigger DevExpress change handler without pressing Enter
-        # (pressing Enter on the last row can submit the form prematurely)
-        driver.execute_script("document.activeElement && document.activeElement.blur();")
+        # Blur the ACTUAL editor element (not document.activeElement, which in
+        # Shadow DOM points to the shadow host rather than the input inside it)
+        driver.execute_script("arguments[0].blur();", editor)
         return True
     except (ElementNotInteractableException, TimeoutException,
             StaleElementReferenceException):
@@ -372,64 +372,105 @@ def _partial_single_po(driver, log, po):
         log(f"  [INFO] No edits succeeded — skipping Save.")
         return
 
+    # ── Close any open editor before saving ───────────────────────────────
+    # If the last edited cell's editor is still open, DevExpress may ignore the
+    # Save click. Blur the editor element directly so DevExpress commits the value.
+    time.sleep(0.4)
+    driver.execute_script("""
+        var editors = document.querySelectorAll(
+            '[id^="POProducts_DXEditor"][id$="_I"]'
+        );
+        editors.forEach(function(e) { e.blur(); });
+    """)
+    time.sleep(0.3)
+
     # ── Click Save ─────────────────────────────────────────────────────────
     log(f"  [INFO] {changes} row(s) updated — clicking Save…")
-    save_result = driver.execute_script("""
-        // Strategy 1 — direct getElementById
-        var el = document.getElementById('EditFormButton_CD');
-        if (el) {
-            el.scrollIntoView({block: 'center'});
-            el.click();
-            return 'id';
-        }
 
-        // Strategy 2 — deep shadow DOM search
-        function deepFind(root) {
-            var found = root.querySelector
-                ? root.querySelector('#EditFormButton_CD') : null;
-            if (found) return found;
-            var nodes = root.querySelectorAll
-                ? Array.from(root.querySelectorAll('*')) : [];
-            for (var n of nodes) {
-                if (n.shadowRoot) {
-                    var r = deepFind(n.shadowRoot);
-                    if (r) return r;
+    # Try Selenium click first — it generates the full event chain
+    # (mousedown → mouseup → click) that DevExpress event handlers expect.
+    save_method = None
+    try:
+        save_btn = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.ID, _SAVE))
+        )
+        save_btn.click()
+        save_method = 'selenium'
+    except (ElementNotInteractableException, TimeoutException):
+        pass
+
+    # JS fallback — covers Shadow DOM and any interactability issues
+    if save_method is None:
+        save_result = driver.execute_script("""
+            // Strategy 1 — direct getElementById
+            var el = document.getElementById('EditFormButton_CD');
+            if (el) {
+                el.scrollIntoView({block: 'center'});
+                el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                el.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
+                el.click();
+                return 'id';
+            }
+
+            // Strategy 2 — deep shadow DOM search
+            function deepFind(root) {
+                var found = root.querySelector
+                    ? root.querySelector('#EditFormButton_CD') : null;
+                if (found) return found;
+                var nodes = root.querySelectorAll
+                    ? Array.from(root.querySelectorAll('*')) : [];
+                for (var n of nodes) {
+                    if (n.shadowRoot) {
+                        var r = deepFind(n.shadowRoot);
+                        if (r) return r;
+                    }
+                }
+                return null;
+            }
+            var el2 = deepFind(document);
+            if (el2) {
+                el2.scrollIntoView({block: 'center'});
+                el2.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                el2.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
+                el2.click();
+                return 'shadow';
+            }
+
+            // Strategy 3 — match by visible "Save" text
+            var hits = Array.from(document.querySelectorAll(
+                'a, button, input[type=button], input[type=submit]'
+            ));
+            for (var c of hits) {
+                if ((c.textContent || c.value || '').trim().toLowerCase() === 'save') {
+                    c.scrollIntoView({block: 'center'});
+                    c.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                    c.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
+                    c.click();
+                    return 'text';
                 }
             }
-            return null;
-        }
-        var el2 = deepFind(document);
-        if (el2) {
-            el2.scrollIntoView({block: 'center'});
-            el2.click();
-            return 'shadow';
-        }
+            return 'not_found';
+        """)
 
-        // Strategy 3 — match by visible "Save" text
-        var hits = Array.from(document.querySelectorAll(
-            'a, button, input[type=button], input[type=submit]'
-        ));
-        for (var c of hits) {
-            if ((c.textContent || c.value || '').trim().toLowerCase() === 'save') {
-                c.scrollIntoView({block: 'center'});
-                c.click();
-                return 'text';
-            }
-        }
-        return 'not_found';
-    """)
+        if save_result == 'not_found':
+            raise RuntimeError(
+                f"Could not find Save button (#{_SAVE}) — tried getElementById, "
+                "shadow DOM search, and text search."
+            )
+        save_method = save_result
 
-    if save_result == 'not_found':
-        raise RuntimeError(
-            f"Could not find Save button (#{_SAVE}) — tried getElementById, "
-            "shadow DOM search, and text search."
-        )
-    log(f"  [INFO] Save clicked (method: {save_result}).")
+    log(f"  [INFO] Save clicked (method: {save_method}).")
 
+    # Verify the save actually went through — URL must leave /PO/Edit/
     try:
         wait.until(lambda d: '/PO/Edit/' not in d.current_url)
     except TimeoutException:
-        pass
+        raise RuntimeError(
+            "Save button was clicked but the page is still on the edit URL "
+            f"after {_WAIT}s. Possible causes: DevExpress validation error, "
+            "the grid editor was still open, or the session expired. "
+            f"Current URL: {driver.current_url}"
+        )
     log(f"  [INFO] Saved. URL: {driver.current_url}")
 
 
