@@ -11,9 +11,9 @@ Steps (mirrors the Chrome Recorder recording):
   3. Click the first result row
   4. Read the grid header row to find ORDERED and SHIPPED column indices
   5. For every product row where ORDERED ≠ SHIPPED:
-       a. Click the ORDERED cell
-       b. Wait for any DXEditor input to appear
-       c. Set value to SHIPPED qty, blur to commit
+       a. ActionChains-click the ORDERED cell (trusted mousedown/up/click)
+       b. Wait for the DXEditor input to appear and JS-focus it
+       c. Type new value via switch_to.active_element + ActionChains TAB to commit
   6. Click Save (#EditFormButton_CD)
   7. Reset browser to PO list and repeat for the next PO number
 """
@@ -22,6 +22,7 @@ import time
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -41,8 +42,8 @@ _ROW0_CELL = '#POResults_DXDataRow0 > td:nth-of-type(3)'
 _SAVE      = 'EditFormButton_CD'
 _WAIT      = 15
 
-# Matches ANY open DX inline editor in the products grid regardless of column index
-# DevExpress IDs follow the pattern: POProducts_DXEditor{col}_I
+# Matches ANY open DX inline editor regardless of column index
+# DevExpress IDs: POProducts_DXEditor{col}_I
 _EDITOR_SEL = '[id^="POProducts_DXEditor"][id$="_I"]'
 
 
@@ -59,7 +60,12 @@ def _go_to_po_list(driver):
 
 
 def _click_cell(driver, row_id, cell_idx, max_attempts=3):
-    """Click a grid cell; falls back to JS click if shadow DOM blocks it."""
+    """
+    Click a grid cell using ActionChains (trusted mousedown/mouseup/click).
+    DevExpress checks event.isTrusted before opening the inline editor;
+    plain el.click() and JS dispatchEvent are untrusted and may be ignored.
+    Falls back to JS click only if ActionChains raises ElementNotInteractable.
+    """
     for attempt in range(max_attempts):
         try:
             row_el = driver.find_element(By.ID, row_id)
@@ -69,7 +75,7 @@ def _click_cell(driver, row_id, cell_idx, max_attempts=3):
                 "arguments[0].scrollIntoView({block:'center'});", cell
             )
             try:
-                cell.click()
+                ActionChains(driver).click(cell).perform()
             except ElementNotInteractableException:
                 driver.execute_script("arguments[0].click();", cell)
             return True
@@ -84,7 +90,6 @@ def _click_cell(driver, row_id, cell_idx, max_attempts=3):
 def _discover_columns(driver, log):
     """
     Read POProducts_DXHeadersRow0 to find the td indices for ORDERED and SHIPPED.
-    Logs every header it finds so we can debug column layout.
     Returns (ordered_idx, shipped_idx) or raises RuntimeError.
     """
     result = driver.execute_script("""
@@ -93,15 +98,14 @@ def _discover_columns(driver, log):
         var tds = hdr.getElementsByTagName('td');
         var out = {ordered: -1, shipped: -1, headers: []};
         for (var i = 0; i < tds.length; i++) {
-            // innerText respects CSS visibility; strip non-alpha chars (sort arrows, etc.)
             var raw = (tds[i].innerText || tds[i].textContent || '');
             var t   = raw.replace(/[^A-Za-z\\s]/g, '')
                          .replace(/\\s+/g, ' ')
                          .trim()
                          .toUpperCase();
             out.headers.push(i + ':' + t);
-            if (t === 'ORDERED')       out.ordered  = i;
-            else if (t === 'SHIPPED')  out.shipped  = i;
+            if (t === 'ORDERED')       out.ordered = i;
+            else if (t === 'SHIPPED')  out.shipped = i;
         }
         return out;
     """)
@@ -121,18 +125,18 @@ def _discover_columns(driver, log):
 
 
 def _read_row_values(driver, row_id, ordered_idx, shipped_idx):
-    """Return (ordered_text, shipped_text) for a row, or (None, None) on error.
-    A blank SHIPPED cell means 0 units shipped — normalised to '0'."""
+    """
+    Return (ordered_text, shipped_text) or (None, None) on error.
+    The site leaves SHIPPED blank instead of '0' when nothing was shipped —
+    normalise blank to '0' so the comparison works correctly.
+    """
     try:
         row_el = driver.find_element(By.ID, row_id)
         cells  = row_el.find_elements(By.TAG_NAME, 'td')
         if len(cells) <= max(ordered_idx, shipped_idx):
             return None, None
         ordered = cells[ordered_idx].text.strip()
-        shipped = cells[shipped_idx].text.strip()
-        # Site leaves the SHIPPED cell blank instead of showing 0
-        if not shipped:
-            shipped = '0'
+        shipped = cells[shipped_idx].text.strip() or '0'
         return ordered, shipped
     except (NoSuchElementException, StaleElementReferenceException):
         return None, None
@@ -141,31 +145,50 @@ def _read_row_values(driver, row_id, ordered_idx, shipped_idx):
 def _set_editor_value(driver, value, log, row_label):
     """
     Set the value in the currently open DX inline editor.
-    Tries Selenium send_keys first; falls back to JS for Shadow DOM.
-    Returns True on success.
+
+    DevExpress ignores untrusted events (isTrusted=false), so we must use
+    WebDriver's native interaction APIs:
+      1. JS focus the editor so it becomes document.activeElement
+      2. switch_to.active_element.send_keys() — generates trusted key events
+      3. ActionChains.send_keys(TAB) — trusted TAB commits the value via
+         DevExpress's blur/change handler
+    Falls back to DevExpress JS API if the active-element approach fails.
     """
     wait = WebDriverWait(driver, _WAIT)
 
-    # ── Selenium path ─────────────────────────────────────────────────────
+    # Wait for the editor input to exist in the DOM
     try:
-        editor = wait.until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, _EDITOR_SEL))
-        )
-        editor.send_keys(Keys.CONTROL + 'a')
-        editor.send_keys(str(value))
-        # Blur the ACTUAL editor element (not document.activeElement, which in
-        # Shadow DOM points to the shadow host rather than the input inside it)
-        driver.execute_script("arguments[0].blur();", editor)
-        return True
-    except (ElementNotInteractableException, TimeoutException,
-            StaleElementReferenceException):
-        log(f"  [WARN] {row_label}: send_keys blocked — falling back to JS")
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, _EDITOR_SEL)))
+    except TimeoutException:
+        log(f"  [WARN] {row_label}: no editor appeared after {_WAIT}s")
+        return False
 
-    # ── JS path ───────────────────────────────────────────────────────────
+    # JS: click + focus the editor so it is the browser's active element.
+    # We can't use Selenium .click() here (might fail for Shadow DOM inputs),
+    # but JS focus() reliably places focus even inside Shadow DOM.
+    driver.execute_script("""
+        var ed = document.querySelector(arguments[0]);
+        if (ed) { ed.click(); ed.focus(); ed.select(); }
+    """, _EDITOR_SEL)
+    time.sleep(0.15)
+
+    # switch_to.active_element always returns the focused element — even when
+    # that element lives inside a Shadow DOM.  send_keys() on it generates
+    # trusted keyboard events that DevExpress's change handler will accept.
+    try:
+        active = driver.switch_to.active_element
+        active.send_keys(Keys.CONTROL + 'a')   # select all existing text
+        active.send_keys(str(value))            # type new value
+        # TAB via ActionChains = trusted blur/change on the editor input,
+        # which is what DevExpress requires to persist the value.
+        ActionChains(driver).send_keys(Keys.TAB).perform()
+        return True
+    except Exception as e:
+        log(f"  [WARN] {row_label}: trusted typing failed ({type(e).__name__}): {e}")
+
+    # Last resort — DevExpress JS API (SetValue on the control object)
     result = driver.execute_script("""
         var val = arguments[0];
-
-        // Strategy 1 — DevExpress ASPxClientControl API
         try {
             var coll = ASPxClientControl.GetControlCollection();
             var all  = coll.GetControls ? coll.GetControls() : [];
@@ -174,58 +197,15 @@ def _set_editor_value(driver, value, log, row_label):
                 if (e.name && e.name.indexOf('POProducts_DXEditor') === 0
                         && typeof e.SetValue === 'function') {
                     e.SetValue(val);
-                    if (typeof e.GetMainElement === 'function')
-                        e.GetMainElement().blur();
                     return 'dxapi:' + e.name;
                 }
             }
         } catch(ex) {}
-
-        // Strategy 2 — querySelector in regular DOM
-        var inp = document.querySelector(
-            '[id^="POProducts_DXEditor"][id$="_I"]'
-        );
-        if (inp) {
-            var s = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value').set;
-            s.call(inp, val);
-            inp.dispatchEvent(new Event('input',  {bubbles: true}));
-            inp.dispatchEvent(new Event('change', {bubbles: true}));
-            inp.blur();
-            return 'css:' + inp.id;
-        }
-
-        // Strategy 3 — deep Shadow DOM search
-        function deepQ(root, sel) {
-            var el = root.querySelector ? root.querySelector(sel) : null;
-            if (el) return el;
-            var nodes = root.querySelectorAll
-                ? Array.from(root.querySelectorAll('*')) : [];
-            for (var n of nodes) {
-                if (n.shadowRoot) {
-                    var f = deepQ(n.shadowRoot, sel);
-                    if (f) return f;
-                }
-            }
-            return null;
-        }
-        var inp2 = deepQ(document,
-            '[id^="POProducts_DXEditor"][id$="_I"]');
-        if (inp2) {
-            var s2 = Object.getOwnPropertyDescriptor(
-                         window.HTMLInputElement.prototype, 'value').set;
-            s2.call(inp2, val);
-            inp2.dispatchEvent(new Event('input',  {bubbles: true}));
-            inp2.dispatchEvent(new Event('change', {bubbles: true}));
-            inp2.blur();
-            return 'shadow:' + inp2.id;
-        }
-
         return 'not_found';
     """, str(value))
 
     if result == 'not_found':
-        log(f"  [WARN] {row_label}: JS could not find the editor input either")
+        log(f"  [WARN] {row_label}: DevExpress API fallback also failed")
         return False
 
     log(f"  [INFO] {row_label}: value set via {result}")
@@ -255,15 +235,27 @@ def _partial_single_po(driver, log, po):
     search.send_keys(Keys.RETURN)
 
     # ── Click first result row ─────────────────────────────────────────────
+    # DevExpress sometimes re-renders the results grid after the search
+    # completes, which invalidates the element reference.  Retry up to 3
+    # times, re-fetching the element each attempt.
     try:
-        row_cell = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, _ROW0_CELL))
-        )
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, _ROW0_CELL)))
     except TimeoutException:
         raise RuntimeError(f"PO {po} did not appear in results after {_WAIT}s.")
 
     log(f"  [INFO] Found result — opening PO detail…")
-    row_cell.click()
+    for attempt in range(3):
+        try:
+            row_cell = driver.find_element(By.CSS_SELECTOR, _ROW0_CELL)
+            ActionChains(driver).click(row_cell).perform()
+            break
+        except StaleElementReferenceException:
+            if attempt == 2:
+                raise RuntimeError(
+                    f"Result row for PO {po} went stale 3 times — "
+                    "DevExpress grid re-rendered unexpectedly."
+                )
+            time.sleep(0.3)
 
     try:
         wait.until(EC.url_contains('/PO/Edit/'))
@@ -275,9 +267,6 @@ def _partial_single_po(driver, log, po):
     log(f"  [INFO] Detail URL: {driver.current_url}")
 
     # ── Wait for product grid with real data ───────────────────────────────
-    # We wait until the grid HEADER row exists AND a data row contains a
-    # dollar-value cell — that confirms DevExpress finished loading the new
-    # PO's products (not the previous page's stale DOM).
     try:
         wait.until(
             EC.presence_of_element_located((By.ID, 'POProducts_DXHeadersRow0'))
@@ -358,55 +347,42 @@ def _partial_single_po(driver, log, po):
 
         ok = _set_editor_value(driver, shipped_text, log, f"Row {row_n+1}")
         if not ok:
-            # Dismiss any open editor so next iteration starts clean
-            try:
-                driver.execute_script(
-                    "var e = document.querySelector(arguments[0]);"
-                    "if (e) e.blur();",
-                    _EDITOR_SEL
-                )
-            except Exception:
-                pass
             continue
 
-        time.sleep(0.3)   # give DevExpress time to commit the value
+        time.sleep(0.3)
         changes += 1
 
     if changes == 0:
         log(f"  [INFO] No edits succeeded — skipping Save.")
         return
 
-    # ── Close any open editor before saving ───────────────────────────────
-    # If the last edited cell's editor is still open, DevExpress may ignore the
-    # Save click. Blur the editor element directly so DevExpress commits the value.
-    time.sleep(0.4)
-    driver.execute_script("""
-        var editors = document.querySelectorAll(
-            '[id^="POProducts_DXEditor"][id$="_I"]'
-        );
-        editors.forEach(function(e) { e.blur(); });
-    """)
-    time.sleep(0.3)
+    # ── Ensure last editor is fully committed before saving ────────────────
+    # TAB in _set_editor_value moved focus away from the last edited cell.
+    # Give DevExpress a moment to process the blur/change, then verify no
+    # editor input is still open.
+    time.sleep(0.5)
+    still_open = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
+    if still_open:
+        log(f"  [WARN] Editor still visible before Save — sending Escape to close")
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        time.sleep(0.3)
 
     # ── Click Save ─────────────────────────────────────────────────────────
     log(f"  [INFO] {changes} row(s) updated — clicking Save…")
 
-    # Try Selenium click first — it generates the full event chain
-    # (mousedown → mouseup → click) that DevExpress event handlers expect.
     save_method = None
     try:
         save_btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.ID, _SAVE))
         )
-        save_btn.click()
+        ActionChains(driver).click(save_btn).perform()
         save_method = 'selenium'
-    except (ElementNotInteractableException, TimeoutException):
+    except (ElementNotInteractableException, TimeoutException,
+            StaleElementReferenceException):
         pass
 
-    # JS fallback — covers Shadow DOM and any interactability issues
     if save_method is None:
         save_result = driver.execute_script("""
-            // Strategy 1 — direct getElementById
             var el = document.getElementById('EditFormButton_CD');
             if (el) {
                 el.scrollIntoView({block: 'center'});
@@ -415,8 +391,6 @@ def _partial_single_po(driver, log, po):
                 el.click();
                 return 'id';
             }
-
-            // Strategy 2 — deep shadow DOM search
             function deepFind(root) {
                 var found = root.querySelector
                     ? root.querySelector('#EditFormButton_CD') : null;
@@ -424,10 +398,7 @@ def _partial_single_po(driver, log, po):
                 var nodes = root.querySelectorAll
                     ? Array.from(root.querySelectorAll('*')) : [];
                 for (var n of nodes) {
-                    if (n.shadowRoot) {
-                        var r = deepFind(n.shadowRoot);
-                        if (r) return r;
-                    }
+                    if (n.shadowRoot) { var r = deepFind(n.shadowRoot); if (r) return r; }
                 }
                 return null;
             }
@@ -439,23 +410,18 @@ def _partial_single_po(driver, log, po):
                 el2.click();
                 return 'shadow';
             }
-
-            // Strategy 3 — match by visible "Save" text
             var hits = Array.from(document.querySelectorAll(
                 'a, button, input[type=button], input[type=submit]'
             ));
             for (var c of hits) {
                 if ((c.textContent || c.value || '').trim().toLowerCase() === 'save') {
                     c.scrollIntoView({block: 'center'});
-                    c.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                    c.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
                     c.click();
                     return 'text';
                 }
             }
             return 'not_found';
         """)
-
         if save_result == 'not_found':
             raise RuntimeError(
                 f"Could not find Save button (#{_SAVE}) — tried getElementById, "
@@ -465,15 +431,14 @@ def _partial_single_po(driver, log, po):
 
     log(f"  [INFO] Save clicked (method: {save_method}).")
 
-    # Verify the save actually went through — URL must leave /PO/Edit/
+    # Verify save went through — page must navigate away from /PO/Edit/
     try:
         wait.until(lambda d: '/PO/Edit/' not in d.current_url)
     except TimeoutException:
         raise RuntimeError(
-            "Save button was clicked but the page is still on the edit URL "
-            f"after {_WAIT}s. Possible causes: DevExpress validation error, "
-            "the grid editor was still open, or the session expired. "
-            f"Current URL: {driver.current_url}"
+            "Save was clicked but the page is still on the edit URL after "
+            f"{_WAIT}s. Possible causes: validation error, editor still open, "
+            f"or session expired. URL: {driver.current_url}"
         )
     log(f"  [INFO] Saved. URL: {driver.current_url}")
 
