@@ -289,6 +289,7 @@
     .log-area .line-ok    { color: var(--accent2); }
     .log-area .line-warn  { color: var(--warn); }
     .log-area .line-error { color: var(--danger); }
+    .log-area .line-browser { color: #f59e0b; }
     .log-area .line-debug { color: #a78bfa; }
 
     .status-pill {
@@ -428,6 +429,11 @@
         <input type="checkbox" id="showBrowserCheck">
         Show browser window (debug mode)
       </label>
+      <div id="debugCredentials" style="display:none; margin-top:8px; padding:8px; background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.3); border-radius:4px;">
+        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">Auto-login credentials (used when browser opens):</div>
+        <input type="text"     id="debugEmail"    placeholder="Email"    autocomplete="username"   style="margin-bottom:4px; font-size:12px;" />
+        <input type="password" id="debugPassword" placeholder="Password" autocomplete="current-password" style="font-size:12px;" />
+      </div>
     </div>
 
     <!-- Excel upload -->
@@ -597,6 +603,24 @@ function getNormalizedUrl() {
 document.getElementById('paramsInput').addEventListener('input', () => {
   document.getElementById('btnInspect').disabled = !getNormalizedUrl();
 });
+
+// ── Debug credentials box ──────────────────────────────────────────────────
+(function () {
+  const chk  = document.getElementById('showBrowserCheck');
+  const box  = document.getElementById('debugCredentials');
+  const eml  = document.getElementById('debugEmail');
+  const pwd  = document.getElementById('debugPassword');
+
+  // Restore saved values
+  eml.value = localStorage.getItem('debugEmail')    || '';
+  pwd.value = localStorage.getItem('debugPassword') || '';
+
+  chk.addEventListener('change', () => {
+    box.style.display = chk.checked ? 'block' : 'none';
+  });
+  eml.addEventListener('input', () => localStorage.setItem('debugEmail',    eml.value));
+  pwd.addEventListener('input', () => localStorage.setItem('debugPassword', pwd.value));
+})();
 
 // ─────────────────────────────────────────────
 //  Inspect Page
@@ -878,7 +902,8 @@ function classifyLine(line) {
   if (u.includes('[ERROR]')) return 'line-error';
   if (u.includes('[WARN]'))  return 'line-warn';
   if (u.includes('[SUCCESS]') || u.includes('✓') || u.includes('✔')) return 'line-ok';
-  if (u.includes('[DEBUG]')) return 'line-debug';
+  if (u.includes('[DEBUG]'))   return 'line-debug';
+  if (u.includes('[BROWSER]')) return 'line-browser';
   return 'line-info';
 }
 
@@ -1008,6 +1033,10 @@ document.getElementById('btnRun').addEventListener('click', async () => {
     paramsObj.po_numbers = poList;
     if (document.getElementById('showBrowserCheck').checked) {
       paramsObj.show_browser = true;
+      const de = document.getElementById('debugEmail').value.trim();
+      const dp = document.getElementById('debugPassword').value.trim();
+      if (de) paramsObj.debug_email    = de;
+      if (dp) paramsObj.debug_password = dp;
     }
   }
 

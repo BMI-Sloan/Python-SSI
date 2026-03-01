@@ -25,11 +25,17 @@ def make_driver(
     headless: bool = True,
     initial_url: Optional[str] = None,
     download_dir: Optional[str] = None,
+    enable_logging: bool = False,
 ) -> webdriver.Chrome:
     opts = Options()
 
     if headless or _must_be_headless():
         opts.add_argument("--headless=new")
+
+    if enable_logging:
+        # Capture browser (JavaScript) console output so it can be read via
+        # driver.get_log('browser').  Must be set before driver creation.
+        opts.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")

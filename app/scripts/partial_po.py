@@ -49,6 +49,75 @@ _EDITOR_SEL = '[id^="POProducts_DXEditor"][id$="_I"]'
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _dump_browser_logs(driver, log, label=''):
+    """
+    Read Chrome browser-console log entries and emit them to the UI log.
+    Only WARNING and SEVERE entries are shown to avoid flooding the output.
+    console.log()/console.error() calls from the page appear here as well —
+    these often reveal DevExpress errors that are invisible in headless mode.
+    """
+    try:
+        entries = driver.get_log('browser')
+    except Exception:
+        return
+    if not entries:
+        return
+    prefix = f'  [BROWSER]{" "+label if label else ""}'
+    for e in entries:
+        lvl = e.get('level', 'INFO')
+        if lvl not in ('WARNING', 'SEVERE'):
+            continue
+        msg = e.get('message', '').replace('\n', ' ')[:300]
+        log(f"{prefix} [{lvl}] {msg}")
+
+
+def _try_login(driver, log, email, password):
+    """
+    Detect the login page and fill in credentials automatically.
+    Called right after the initial navigation; a no-op if already logged in.
+    """
+    # Give the page a moment to settle then check for a password input
+    time.sleep(1)
+    pwd_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
+    if not pwd_inputs:
+        return  # not on login page
+
+    log("  [INFO] Login page detected — filling credentials…")
+    try:
+        # Find email/username field — try common ASP.NET MVC patterns
+        email_field = None
+        for sel in [
+            'input[name="Email"]', 'input[type="email"]',
+            'input[name="UserName"]', 'input[name="username"]',
+            '#Email', '#UserName',
+        ]:
+            matches = driver.find_elements(By.CSS_SELECTOR, sel)
+            if matches:
+                email_field = matches[0]
+                break
+
+        if not email_field:
+            raise RuntimeError("Could not find email/username field on login page")
+
+        email_field.clear()
+        email_field.send_keys(email)
+
+        pwd_inputs[0].clear()
+        pwd_inputs[0].send_keys(password)
+        pwd_inputs[0].send_keys(Keys.RETURN)
+
+        # Wait up to 15 s for the login redirect
+        WebDriverWait(driver, 15).until(
+            lambda d: not d.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
+        )
+        log(f"  [INFO] Login successful — URL: {driver.current_url}")
+    except TimeoutException:
+        raise RuntimeError(
+            "Login failed — still seeing a password field after 15 s. "
+            "Check credentials in the debug panel."
+        )
+
+
 def _go_to_po_list(driver):
     driver.get(_PO_LIST)
     try:
@@ -233,11 +302,17 @@ def _set_editor_value(driver, value, log, row_label):
 
 # ── core PO logic ─────────────────────────────────────────────────────────────
 
-def _partial_single_po(driver, log, po):
+def _partial_single_po(driver, log, po,
+                        debug_email=None, debug_password=None,
+                        capture_logs=False):
     wait = WebDriverWait(driver, _WAIT)
 
-    # ── Navigate to PO list and search ────────────────────────────────────
+    # ── Navigate to PO list (auto-login if credentials supplied) ──────────
     _go_to_po_list(driver)
+    if debug_email and debug_password:
+        _try_login(driver, log, debug_email, debug_password)
+    if capture_logs:
+        _dump_browser_logs(driver, log, 'after nav to PO list')
 
     try:
         search = wait.until(EC.presence_of_element_located((By.ID, _SEARCH)))
@@ -306,6 +381,8 @@ def _partial_single_po(driver, log, po):
 
     # ── Discover column indices from header ────────────────────────────────
     ordered_idx, shipped_idx = _discover_columns(driver, log)
+    if capture_logs:
+        _dump_browser_logs(driver, log, 'after column discovery')
 
     # ── Diagnostic: show data values around discovered columns ─────────────
     try:
@@ -444,6 +521,8 @@ def _partial_single_po(driver, log, po):
     """, api_payload)
 
     log(f"  [DIAG] DevExpress API result: {api_result}")
+    if capture_logs:
+        _dump_browser_logs(driver, log, 'after DevExpress API call')
 
     if isinstance(api_result, dict) and api_result.get('status') == 'ok':
         changes = api_result.get('applied', 0)
@@ -553,11 +632,15 @@ def _partial_single_po(driver, log, po):
         save_method = save_result
 
     log(f"  [INFO] Save clicked (method: {save_method}).")
+    if capture_logs:
+        _dump_browser_logs(driver, log, 'after Save click')
 
     # Verify save went through — page must navigate away from /PO/Edit/
     try:
         wait.until(lambda d: '/PO/Edit/' not in d.current_url)
     except TimeoutException:
+        if capture_logs:
+            _dump_browser_logs(driver, log, 'save timeout — page did not navigate')
         raise RuntimeError(
             "Save was clicked but the page is still on the edit URL after "
             f"{_WAIT}s. Possible causes: validation error, editor still open, "
@@ -583,12 +666,24 @@ def run(log, excel_path, cookies, params):
         log(f"  • {n}")
     log("─" * 60)
 
-    # Set show_browser=true in Extra Parameters to watch the browser live.
-    # Useful for debugging when edits appear to succeed but nothing changes.
-    headless = not str(params.get('show_browser', '')).lower() in ('true', '1', 'yes')
+    # Debug mode: check "Show browser window" checkbox in the UI.
+    # When active, the browser opens visibly, auto-logs in with debug
+    # credentials (if supplied), and streams Chrome console entries to the log.
+    debug_mode    = str(params.get('show_browser', '')).lower() in ('true', '1', 'yes')
+    debug_email   = params.get('debug_email')    or None
+    debug_password= params.get('debug_password') or None
+    headless      = not debug_mode
+
     log(f"[INFO] Starting browser {'(headless)' if headless else '(VISIBLE — debug mode)'}…")
+    if debug_mode and debug_email:
+        log(f"[INFO] Debug credentials: {debug_email} / {'*' * len(debug_password or '')}")
     try:
-        driver = make_driver(cookies=cookies, headless=headless, initial_url=_HOME)
+        driver = make_driver(
+            cookies=cookies,
+            headless=headless,
+            initial_url=_HOME,
+            enable_logging=debug_mode,
+        )
     except Exception as exc:
         log(f"[ERROR] Browser failed to start: {exc}")
         return
@@ -599,7 +694,12 @@ def run(log, excel_path, cookies, params):
         for i, po in enumerate(po_numbers, 1):
             log(f"[INFO] ({i}/{len(po_numbers)}) Processing PO: {po}")
             try:
-                _partial_single_po(driver, log, po)
+                _partial_single_po(
+                    driver, log, po,
+                    debug_email=debug_email,
+                    debug_password=debug_password,
+                    capture_logs=debug_mode,
+                )
                 success_count += 1
                 log(f"  [SUCCESS] PO {po} done.")
             except Exception as exc:
