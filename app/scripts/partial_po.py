@@ -42,11 +42,11 @@ _ROW0_CELL = '#POResults_DXDataRow0 > td:nth-of-type(3)'
 _SAVE      = 'EditFormButton_CD'
 _WAIT      = 15
 
-# Both Chrome Recorder recordings show the ORDERED editor is always column 13:
-#   #POProducts_DXEditor13_I
-# The fallback selector matches ANY open DX editor in case the index shifts.
-_EDITOR_ID  = 'POProducts_DXEditor13_I'
-_EDITOR_SEL = f'#{_EDITOR_ID}, [id^="POProducts_DXEditor"][id$="_I"]'
+# All three Chrome Recorder recordings confirm the ORDERED column is always
+# td:nth-of-type(15) — that is index 14 (0-based) among direct-child tds.
+# The editor that opens is always #POProducts_DXEditor13_I.
+_ORDERED_COL = 14   # 0-based direct-child td index; CSS nth-of-type is 1-based so +1 = 15
+_EDITOR_SEL  = '#POProducts_DXEditor13_I, [id^="POProducts_DXEditor"][id$="_I"]'
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -130,31 +130,29 @@ def _go_to_po_list(driver):
         pass
 
 
-def _click_cell(driver, row_id, cell_idx, max_attempts=3):
+def _click_ordered_cell(driver, row_n, max_attempts=3):
     """
-    Click a grid cell using ActionChains (trusted mousedown/mouseup/click).
+    Click the ORDERED cell using the exact CSS selector from Chrome Recorder:
+        #POProducts_DXDataRowN > td:nth-of-type(15)
 
-    The Chrome Recorder shows the click target is div.dxgBCTC *inside* the td —
-    that is where DevExpress attaches its cell-click handler.  Clicking the td
-    itself does nothing.  Falls back to clicking the td if dxgBCTC is absent.
+    The `> td` (direct child) is critical — find_elements(TAG_NAME, 'td')
+    returns ALL descendant tds including nested ones, which shifts the index.
+    CSS nth-of-type(15) counts only direct-child tds, matching index 14 (0-based).
     """
+    # nth-of-type is 1-indexed: index 14 → nth-of-type(15)
+    css = f'#POProducts_DXDataRow{row_n} > td:nth-of-type({_ORDERED_COL + 1})'
     for attempt in range(max_attempts):
         try:
-            row_el = driver.find_element(By.ID, row_id)
-            cells  = row_el.find_elements(By.TAG_NAME, 'td')
-            cell   = cells[cell_idx]
+            cell = driver.find_element(By.CSS_SELECTOR, css)
             driver.execute_script(
                 "arguments[0].scrollIntoView({block:'center'});", cell
             )
-            # Prefer the inner dxgBCTC div — DevExpress listens for clicks there
-            inner  = cell.find_elements(By.CSS_SELECTOR, 'div.dxgBCTC')
-            target = inner[0] if inner else cell
-            ActionChains(driver).click(target).perform()
+            ActionChains(driver).click(cell).perform()
             return True
         except StaleElementReferenceException:
             if attempt < max_attempts - 1:
                 time.sleep(0.3)
-        except (NoSuchElementException, IndexError):
+        except NoSuchElementException:
             return False
     return False
 
@@ -204,18 +202,22 @@ def _discover_columns(driver, log):
     )
 
 
-def _read_row_values(driver, row_id, ordered_idx, shipped_idx):
+def _read_row_values(driver, row_id, shipped_idx):
     """
     Return (ordered_text, shipped_text) or (None, None) on error.
     The site leaves SHIPPED blank instead of '0' when nothing was shipped —
     normalise blank to '0' so the comparison works correctly.
+
+    Uses XPath './td' (direct children only) so the index matches CSS
+    > td:nth-of-type which also counts direct children.
     """
     try:
         row_el = driver.find_element(By.ID, row_id)
-        cells  = row_el.find_elements(By.TAG_NAME, 'td')
-        if len(cells) <= max(ordered_idx, shipped_idx):
+        # Direct children only — same count as CSS `> td:nth-of-type`
+        cells  = row_el.find_elements(By.XPATH, './td')
+        if len(cells) <= max(_ORDERED_COL, shipped_idx):
             return None, None
-        ordered = cells[ordered_idx].text.strip()
+        ordered = cells[_ORDERED_COL].text.strip()
         shipped = cells[shipped_idx].text.strip() or '0'
         return ordered, shipped
     except (NoSuchElementException, StaleElementReferenceException):
@@ -350,38 +352,42 @@ def _partial_single_po(driver, log, po,
         log(f"  [INFO] No product rows found — nothing to adjust.")
         return
 
-    # ── Discover column indices from header ────────────────────────────────
-    ordered_idx, shipped_idx = _discover_columns(driver, log)
+    # ── Discover SHIPPED column index from header ──────────────────────────
+    # ORDERED is always td[14] (hardcoded, confirmed by all Chrome Recorder
+    # recordings).  We still discover SHIPPED dynamically since we need it
+    # to read and compare values.
+    try:
+        _, shipped_idx = _discover_columns(driver, log)
+    except RuntimeError as e:
+        log(f"  [WARN] Column discovery failed ({e}) — using fallback shipped_idx=15")
+        shipped_idx = _ORDERED_COL + 1  # fallback: SHIPPED is right after ORDERED
     if capture_logs:
         _dump_browser_logs(driver, log, 'after column discovery')
 
-    # ── Diagnostic: show data values around discovered columns ─────────────
+    # ── Diagnostic: show direct-child td values around the ORDERED column ──
     try:
-        start = max(0, ordered_idx - 2)
-        end   = shipped_idx + 3
-        diag  = driver.execute_script("""
-            var start = arguments[0], end = arguments[1];
+        diag = driver.execute_script("""
             var row = document.getElementById('POProducts_DXDataRow0');
             if (!row) return null;
-            var cells = row.querySelectorAll('td');
+            var cells = Array.from(row.children).filter(n => n.tagName === 'TD');
             var out = [];
-            for (var i = start; i < Math.min(end, cells.length); i++) {
+            for (var i = 12; i < Math.min(18, cells.length); i++) {
                 out.push(i + ':' + cells[i].textContent.trim());
             }
             return out.join(' | ');
-        """, start, end)
+        """)
         if diag:
-            log(f"  [DIAG] Row 0 td[{start}-{end-1}]: {diag}")
+            log(f"  [DIAG] Row 0 direct-child tds[12-17]: {diag}")
     except Exception:
         pass
 
-    # ── Pass 1: read all row values (no element refs kept) ─────────────────
+    # ── Pass 1: read all row values ────────────────────────────────────────
     rows_to_edit = []
     row_n = 0
 
     while True:
         row_id = f'POProducts_DXDataRow{row_n}'
-        ordered, shipped = _read_row_values(driver, row_id, ordered_idx, shipped_idx)
+        ordered, shipped = _read_row_values(driver, row_id, shipped_idx)
 
         if ordered is None and shipped is None:
             if not driver.find_elements(By.ID, row_id):
@@ -401,18 +407,17 @@ def _partial_single_po(driver, log, po,
         log(f"  [INFO] All rows already match — nothing to save.")
         return
 
-    # ── Pass 2: click each cell, type the value, commit with Enter ────────
-    # Matches Chrome Recorder recording 2 exactly:
-    #   1. Click td:nth-of-type(15) [div.dxgBCTC preferred, td as fallback]
-    #   2. Wait for #POProducts_DXEditor13_I to appear
-    #   3. Ctrl+A → type new value → press Enter to commit
+    # ── Pass 2: click td:nth-of-type(15), type value, commit with Enter ───
+    # Uses the exact CSS selector from all three Chrome Recorder recordings:
+    #   #POProducts_DXDataRowN > td:nth-of-type(15)
+    # The `>` (direct child) is what makes the index reliable.
     changes = 0
     for row_n, row_id, shipped_text in rows_to_edit:
         label = f"Row {row_n+1}"
 
-        clicked = _click_cell(driver, row_id, ordered_idx)
+        clicked = _click_ordered_cell(driver, row_n)
         if not clicked:
-            log(f"  [WARN] {label}: could not click ORDERED cell (td[{ordered_idx}]) — skipping")
+            log(f"  [WARN] {label}: could not find/click #POProducts_DXDataRow{row_n} > td:nth-of-type({_ORDERED_COL + 1})")
             continue
 
         time.sleep(0.4)
@@ -421,18 +426,20 @@ def _partial_single_po(driver, log, po,
         if editors_now:
             log(f"  [DIAG] {label}: editor OPEN — id={editors_now[0].get_attribute('id')}")
         else:
-            log(f"  [DIAG] {label}: editor NOT OPEN after click — cell may be wrong td index")
+            log(f"  [DIAG] {label}: editor NOT OPEN — td:nth-of-type({_ORDERED_COL + 1}) may be wrong column")
 
         ok = _set_editor_value(driver, shipped_text, log, label)
         if ok:
             changes += 1
 
-        # Verify the cell text updated after Enter-commit
+        # Confirm the cell text changed after commit
         time.sleep(0.3)
         try:
-            row_el = driver.find_element(By.ID, row_id)
-            new_val = row_el.find_elements(By.TAG_NAME, 'td')[ordered_idx].text.strip()
-            log(f"  [DIAG] {label}: td[{ordered_idx}] value after commit = '{new_val}'")
+            new_val = driver.find_element(
+                By.CSS_SELECTOR,
+                f'#POProducts_DXDataRow{row_n} > td:nth-of-type({_ORDERED_COL + 1})'
+            ).text.strip()
+            log(f"  [DIAG] {label}: cell value after commit = '{new_val}' (expected '{shipped_text}')")
         except Exception:
             pass
 
