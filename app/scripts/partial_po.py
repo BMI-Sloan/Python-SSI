@@ -345,32 +345,127 @@ def _partial_single_po(driver, log, po):
         log(f"  [INFO] All rows already match — nothing to save.")
         return
 
-    # ── Pass 2: click and edit each mismatched cell ────────────────────────
-    changes = 0
-    for row_n, row_id, shipped_text in rows_to_edit:
+    # ── Edit values via DevExpress JavaScript API ──────────────────────────
+    # Clicking cells + simulating keystrokes has been unreliable because
+    # DevExpress may check event.isTrusted or require specific focus state.
+    # Using the grid's own JS API bypasses all of that entirely.
+    api_payload = [
+        {'rowIndex': row_n, 'value': int(shipped_text) if shipped_text.isdigit() else 0}
+        for row_n, row_id, shipped_text in rows_to_edit
+    ]
 
-        clicked = _click_cell(driver, row_id, ordered_idx)
-        if not clicked:
-            log(f"  [WARN] Row {row_n+1}: could not click ORDERED cell — skipping")
-            continue
+    api_result = driver.execute_script("""
+        var rows = arguments[0];   // [{rowIndex: N, value: V}, ...]
+        try {
+            var coll = ASPxClientControl.GetControlCollection();
+            var controls = coll.GetControls ? coll.GetControls() : [];
+            var grid = null;
 
-        time.sleep(0.5)   # give DevExpress time to open the inline editor
+            // Find the POProducts grid control
+            for (var i = 0; i < controls.length; i++) {
+                var c = controls[i];
+                if (c.name && c.name.indexOf('POProducts') >= 0
+                        && typeof c.GetColumnCount === 'function') {
+                    grid = c;
+                    break;
+                }
+            }
+            if (!grid) return {status: 'no_grid'};
 
-        # Diagnostic: confirm whether the inline editor actually appeared.
-        # If this always shows NOT OPEN, the cell click is not triggering
-        # DevExpress to open an editor (wrong cell, wrong click type, etc.)
-        editors_now = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
-        if editors_now:
-            log(f"  [DIAG] Row {row_n+1}: editor OPEN — id={editors_now[0].get_attribute('id')}")
-        else:
-            log(f"  [DIAG] Row {row_n+1}: editor NOT OPEN after click — will wait up to {_WAIT}s")
+            // Find the ORDERED column index within DevExpress
+            // (DevExpress column index != DOM td index)
+            var dxColIdx  = -1;
+            var fieldName = null;
+            var allCols   = [];
+            for (var j = 0; j < grid.GetColumnCount(); j++) {
+                var col = grid.GetColumn(j);
+                var hdr = (col.headerCaption || col.name || '')
+                              .replace(/[^A-Za-z\\s]/g, '')
+                              .trim().toUpperCase();
+                allCols.push(j + ':' + hdr + '(' + (col.fieldName||col.name) + ')');
+                if (hdr === 'ORDERED') {
+                    dxColIdx  = j;
+                    fieldName = col.fieldName || col.name;
+                }
+            }
+            if (dxColIdx < 0) return {
+                status: 'no_ordered_col',
+                cols: allCols.join(', ')
+            };
 
-        ok = _set_editor_value(driver, shipped_text, log, f"Row {row_n+1}")
-        if not ok:
-            continue
+            var applied = 0;
 
-        time.sleep(0.3)
-        changes += 1
+            // ── Batch edit mode ──────────────────────────────────────────
+            if (grid.batchEditApi) {
+                for (var k = 0; k < rows.length; k++) {
+                    grid.batchEditApi.SetCellValue(
+                        rows[k].rowIndex, fieldName, rows[k].value
+                    );
+                    applied++;
+                }
+                return {
+                    status: 'ok', method: 'batch',
+                    field: fieldName, applied: applied
+                };
+            }
+
+            // ── Cell (inline) edit mode ──────────────────────────────────
+            if (typeof grid.StartEdit === 'function') {
+                for (var k = 0; k < rows.length; k++) {
+                    grid.StartEdit(rows[k].rowIndex);
+                    var editor = grid.GetEditor(dxColIdx);
+                    if (editor && typeof editor.SetValue === 'function') {
+                        editor.SetValue(rows[k].value);
+                        applied++;
+                    }
+                    if (typeof grid.UpdateEdit === 'function') {
+                        grid.UpdateEdit();
+                    }
+                }
+                return {
+                    status: 'ok', method: 'cell',
+                    field: fieldName, applied: applied
+                };
+            }
+
+            return {status: 'no_edit_api', gridName: grid.name};
+
+        } catch(e) {
+            return {status: 'error', msg: e.toString()};
+        }
+    """, api_payload)
+
+    log(f"  [DIAG] DevExpress API result: {api_result}")
+
+    if isinstance(api_result, dict) and api_result.get('status') == 'ok':
+        changes = api_result.get('applied', 0)
+        log(f"  [INFO] {changes} value(s) set via DevExpress "
+            f"{api_result.get('method')} API (field={api_result.get('field')!r})")
+    else:
+        # ── Fallback: click/type simulation ───────────────────────────────
+        log(f"  [WARN] DevExpress API unavailable — falling back to click/type simulation")
+        changes = 0
+        for row_n, row_id, shipped_text in rows_to_edit:
+
+            clicked = _click_cell(driver, row_id, ordered_idx)
+            if not clicked:
+                log(f"  [WARN] Row {row_n+1}: could not click ORDERED cell — skipping")
+                continue
+
+            time.sleep(0.5)
+
+            editors_now = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
+            if editors_now:
+                log(f"  [DIAG] Row {row_n+1}: editor OPEN — id={editors_now[0].get_attribute('id')}")
+            else:
+                log(f"  [DIAG] Row {row_n+1}: editor NOT OPEN after click")
+
+            ok = _set_editor_value(driver, shipped_text, log, f"Row {row_n+1}")
+            if not ok:
+                continue
+
+            time.sleep(0.3)
+            changes += 1
 
     if changes == 0:
         log(f"  [INFO] No edits succeeded — skipping Save.")
