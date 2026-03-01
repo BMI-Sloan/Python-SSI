@@ -131,9 +131,10 @@ def _go_to_po_list(driver):
 def _click_cell(driver, row_id, cell_idx, max_attempts=3):
     """
     Click a grid cell using ActionChains (trusted mousedown/mouseup/click).
-    DevExpress checks event.isTrusted before opening the inline editor;
-    plain el.click() and JS dispatchEvent are untrusted and may be ignored.
-    Falls back to JS click only if ActionChains raises ElementNotInteractable.
+
+    The Chrome Recorder shows the click target is div.dxgBCTC *inside* the td —
+    that is where DevExpress attaches its cell-click handler.  Clicking the td
+    itself does nothing.  Falls back to clicking the td if dxgBCTC is absent.
     """
     for attempt in range(max_attempts):
         try:
@@ -143,10 +144,10 @@ def _click_cell(driver, row_id, cell_idx, max_attempts=3):
             driver.execute_script(
                 "arguments[0].scrollIntoView({block:'center'});", cell
             )
-            try:
-                ActionChains(driver).click(cell).perform()
-            except ElementNotInteractableException:
-                driver.execute_script("arguments[0].click();", cell)
+            # Prefer the inner dxgBCTC div — DevExpress listens for clicks there
+            inner  = cell.find_elements(By.CSS_SELECTOR, 'div.dxgBCTC')
+            target = inner[0] if inner else cell
+            ActionChains(driver).click(target).perform()
             return True
         except StaleElementReferenceException:
             if attempt < max_attempts - 1:
@@ -221,82 +222,52 @@ def _read_row_values(driver, row_id, ordered_idx, shipped_idx):
 
 def _set_editor_value(driver, value, log, row_label):
     """
-    Set the value in the currently open DX inline editor.
+    Type a value into the currently open DevExpress inline editor, then
+    commit it by clicking div.contentArea — exactly what the Chrome Recorder
+    shows a human doing.
 
-    DevExpress ignores untrusted events (isTrusted=false), so we must use
-    WebDriver's native interaction APIs:
-      1. JS focus the editor so it becomes document.activeElement
-      2. switch_to.active_element.send_keys() — generates trusted key events
-      3. ActionChains.send_keys(TAB) — trusted TAB commits the value via
-         DevExpress's blur/change handler
-    Falls back to DevExpress JS API if the active-element approach fails.
+    Flow:
+      1. Wait for the editor input (id starts with POProducts_DXEditor, ends _I)
+      2. JS-focus it so WebDriver can address it via switch_to.active_element
+      3. Ctrl+A → type new value (trusted keyboard events)
+      4. Click div.contentArea to blur → DevExpress fires change handler
     """
     wait = WebDriverWait(driver, _WAIT)
 
-    # Wait for the editor input to exist in the DOM
+    # Wait for the editor input to appear in the DOM
     try:
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, _EDITOR_SEL)))
     except TimeoutException:
         log(f"  [WARN] {row_label}: no editor appeared after {_WAIT}s")
         return False
 
-    # JS: click + focus the editor so it is the browser's active element.
-    # We can't use Selenium .click() here (might fail for Shadow DOM inputs),
-    # but JS focus() reliably places focus even inside Shadow DOM.
+    # Focus the editor via JS so switch_to.active_element finds it reliably
     driver.execute_script("""
         var ed = document.querySelector(arguments[0]);
-        if (ed) { ed.click(); ed.focus(); ed.select(); }
+        if (ed) { ed.focus(); ed.select(); }
     """, _EDITOR_SEL)
-    time.sleep(0.15)
+    time.sleep(0.1)
 
-    # switch_to.active_element always returns the focused element — even when
-    # that element lives inside a Shadow DOM.  send_keys() on it generates
-    # trusted keyboard events that DevExpress's change handler will accept.
+    active    = driver.switch_to.active_element
+    active_id = active.get_attribute('id') or '(no id)'
+    log(f"  [DIAG] {row_label}: active element id='{active_id}'")
+
+    active.send_keys(Keys.CONTROL + 'a')  # select all
+    active.send_keys(str(value))           # type new value
+
+    # Chrome Recorder commits the edit by clicking somewhere else on the page
+    # (div.contentArea at y≈1353), NOT by pressing TAB.  This is what triggers
+    # DevExpress's blur/change handler and persists the value.
     try:
-        active = driver.switch_to.active_element
-        active_id  = active.get_attribute('id')  or '(no id)'
-        active_tag = active.tag_name
-        log(f"  [DIAG] {row_label}: active element = <{active_tag} id='{active_id}'>")
-        active.send_keys(Keys.CONTROL + 'a')   # select all existing text
-        active.send_keys(str(value))            # type new value
-        # TAB via ActionChains = trusted blur/change on the editor input,
-        # which is what DevExpress requires to persist the value.
+        content_area = driver.find_element(By.CSS_SELECTOR, 'div.contentArea')
+        ActionChains(driver).click(content_area).perform()
+        log(f"  [DIAG] {row_label}: committed by clicking div.contentArea")
+    except (NoSuchElementException, ElementNotInteractableException):
+        # If contentArea is not found, fall back to TAB
         ActionChains(driver).send_keys(Keys.TAB).perform()
-        log(f"  [DIAG] {row_label}: typed '{value}' + TAB — checking editor value…")
-        # Brief pause then log what value the editor now shows (before commit)
-        time.sleep(0.1)
-        post_val = driver.execute_script(
-            "var e = document.querySelector(arguments[0]); return e ? e.value : null;",
-            _EDITOR_SEL
-        )
-        log(f"  [DIAG] {row_label}: editor value after typing = {post_val!r}")
-        return True
-    except Exception as e:
-        log(f"  [WARN] {row_label}: trusted typing failed ({type(e).__name__}): {e}")
+        log(f"  [DIAG] {row_label}: committed by TAB (contentArea not found)")
 
-    # Last resort — DevExpress JS API (SetValue on the control object)
-    result = driver.execute_script("""
-        var val = arguments[0];
-        try {
-            var coll = ASPxClientControl.GetControlCollection();
-            var all  = coll.GetControls ? coll.GetControls() : [];
-            for (var i = 0; i < all.length; i++) {
-                var e = all[i];
-                if (e.name && e.name.indexOf('POProducts_DXEditor') === 0
-                        && typeof e.SetValue === 'function') {
-                    e.SetValue(val);
-                    return 'dxapi:' + e.name;
-                }
-            }
-        } catch(ex) {}
-        return 'not_found';
-    """, str(value))
-
-    if result == 'not_found':
-        log(f"  [WARN] {row_label}: DevExpress API fallback also failed")
-        return False
-
-    log(f"  [INFO] {row_label}: value set via {result}")
+    time.sleep(0.1)
     return True
 
 
@@ -430,206 +401,73 @@ def _partial_single_po(driver, log, po,
         log(f"  [INFO] All rows already match — nothing to save.")
         return
 
-    # ── Edit values via DevExpress JavaScript API ──────────────────────────
-    # Clicking cells + simulating keystrokes has been unreliable because
-    # DevExpress may check event.isTrusted or require specific focus state.
-    # Using the grid's own JS API bypasses all of that entirely.
-    api_payload = [
-        {'rowIndex': row_n, 'value': int(shipped_text) if shipped_text.isdigit() else 0}
-        for row_n, row_id, shipped_text in rows_to_edit
-    ]
+    # ── Pass 2: click each cell, type the value, click away to commit ──────
+    # Based on the Chrome Recorder recording of a human making this edit:
+    #   • Click div.dxgBCTC inside the td  (NOT the td itself)
+    #   • Type the new value via the editor input
+    #   • Click div.contentArea to blur/commit  (NOT TAB)
+    changes = 0
+    for row_n, row_id, shipped_text in rows_to_edit:
+        label = f"Row {row_n+1}"
 
-    api_result = driver.execute_script("""
-        var rows = arguments[0];   // [{rowIndex: N, value: V}, ...]
-        try {
-            var coll = ASPxClientControl.GetControlCollection();
-            var controls = coll.GetControls ? coll.GetControls() : [];
-            var grid = null;
+        clicked = _click_cell(driver, row_id, ordered_idx)
+        if not clicked:
+            log(f"  [WARN] {label}: could not click ORDERED cell — skipping")
+            continue
 
-            // Find the POProducts grid control
-            for (var i = 0; i < controls.length; i++) {
-                var c = controls[i];
-                if (c.name && c.name.indexOf('POProducts') >= 0
-                        && typeof c.GetColumnCount === 'function') {
-                    grid = c;
-                    break;
-                }
-            }
-            if (!grid) return {status: 'no_grid'};
+        time.sleep(0.4)
 
-            // Find the ORDERED column index within DevExpress
-            // (DevExpress column index != DOM td index)
-            var dxColIdx  = -1;
-            var fieldName = null;
-            var allCols   = [];
-            for (var j = 0; j < grid.GetColumnCount(); j++) {
-                var col = grid.GetColumn(j);
-                var hdr = (col.headerCaption || col.name || '')
-                              .replace(/[^A-Za-z\\s]/g, '')
-                              .trim().toUpperCase();
-                allCols.push(j + ':' + hdr + '(' + (col.fieldName||col.name) + ')');
-                if (hdr === 'ORDERED') {
-                    dxColIdx  = j;
-                    fieldName = col.fieldName || col.name;
-                }
-            }
-            if (dxColIdx < 0) return {
-                status: 'no_ordered_col',
-                cols: allCols.join(', ')
-            };
+        editors_now = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
+        if editors_now:
+            log(f"  [DIAG] {label}: editor OPEN — id={editors_now[0].get_attribute('id')}")
+        else:
+            log(f"  [DIAG] {label}: editor NOT OPEN after click")
 
-            var applied = 0;
-
-            // ── Batch edit mode ──────────────────────────────────────────
-            if (grid.batchEditApi) {
-                for (var k = 0; k < rows.length; k++) {
-                    grid.batchEditApi.SetCellValue(
-                        rows[k].rowIndex, fieldName, rows[k].value
-                    );
-                    applied++;
-                }
-                return {
-                    status: 'ok', method: 'batch',
-                    field: fieldName, applied: applied
-                };
-            }
-
-            // ── Cell (inline) edit mode ──────────────────────────────────
-            if (typeof grid.StartEdit === 'function') {
-                for (var k = 0; k < rows.length; k++) {
-                    grid.StartEdit(rows[k].rowIndex);
-                    var editor = grid.GetEditor(dxColIdx);
-                    if (editor && typeof editor.SetValue === 'function') {
-                        editor.SetValue(rows[k].value);
-                        applied++;
-                    }
-                    if (typeof grid.UpdateEdit === 'function') {
-                        grid.UpdateEdit();
-                    }
-                }
-                return {
-                    status: 'ok', method: 'cell',
-                    field: fieldName, applied: applied
-                };
-            }
-
-            return {status: 'no_edit_api', gridName: grid.name};
-
-        } catch(e) {
-            return {status: 'error', msg: e.toString()};
-        }
-    """, api_payload)
-
-    log(f"  [DIAG] DevExpress API result: {api_result}")
-    if capture_logs:
-        _dump_browser_logs(driver, log, 'after DevExpress API call')
-
-    if isinstance(api_result, dict) and api_result.get('status') == 'ok':
-        changes = api_result.get('applied', 0)
-        log(f"  [INFO] {changes} value(s) set via DevExpress "
-            f"{api_result.get('method')} API (field={api_result.get('field')!r})")
-    else:
-        # ── Fallback: click/type simulation ───────────────────────────────
-        log(f"  [WARN] DevExpress API unavailable — falling back to click/type simulation")
-        changes = 0
-        for row_n, row_id, shipped_text in rows_to_edit:
-
-            clicked = _click_cell(driver, row_id, ordered_idx)
-            if not clicked:
-                log(f"  [WARN] Row {row_n+1}: could not click ORDERED cell — skipping")
-                continue
-
-            time.sleep(0.5)
-
-            editors_now = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
-            if editors_now:
-                log(f"  [DIAG] Row {row_n+1}: editor OPEN — id={editors_now[0].get_attribute('id')}")
-            else:
-                log(f"  [DIAG] Row {row_n+1}: editor NOT OPEN after click")
-
-            ok = _set_editor_value(driver, shipped_text, log, f"Row {row_n+1}")
-            if not ok:
-                continue
-
-            time.sleep(0.3)
+        ok = _set_editor_value(driver, shipped_text, log, label)
+        if ok:
             changes += 1
+        time.sleep(0.3)
+
+    if capture_logs:
+        _dump_browser_logs(driver, log, 'after all edits')
 
     if changes == 0:
         log(f"  [INFO] No edits succeeded — skipping Save.")
         return
 
-    # ── Ensure last editor is fully committed before saving ────────────────
-    # TAB in _set_editor_value moved focus away from the last edited cell.
-    # Give DevExpress a moment to process the blur/change, then verify no
-    # editor input is still open.
-    time.sleep(0.5)
-    still_open = driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
-    if still_open:
-        log(f"  [WARN] Editor still visible before Save — sending Escape to close")
-        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-        time.sleep(0.3)
-
     # ── Click Save ─────────────────────────────────────────────────────────
+    # Chrome Recorder: click the <span> inside #EditFormButton_CD, not the
+    # outer div.  The span is the actual clickable label.
     log(f"  [INFO] {changes} row(s) updated — clicking Save…")
 
     save_method = None
     try:
-        save_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.ID, _SAVE))
+        save_span = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, f'#{_SAVE} span'))
         )
-        ActionChains(driver).click(save_btn).perform()
-        save_method = 'selenium'
-    except (ElementNotInteractableException, TimeoutException,
-            StaleElementReferenceException):
+        ActionChains(driver).click(save_span).perform()
+        save_method = 'span'
+    except (TimeoutException, NoSuchElementException,
+            StaleElementReferenceException, ElementNotInteractableException):
         pass
 
     if save_method is None:
-        save_result = driver.execute_script("""
-            var el = document.getElementById('EditFormButton_CD');
-            if (el) {
-                el.scrollIntoView({block: 'center'});
-                el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                el.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
-                el.click();
-                return 'id';
-            }
-            function deepFind(root) {
-                var found = root.querySelector
-                    ? root.querySelector('#EditFormButton_CD') : null;
-                if (found) return found;
-                var nodes = root.querySelectorAll
-                    ? Array.from(root.querySelectorAll('*')) : [];
-                for (var n of nodes) {
-                    if (n.shadowRoot) { var r = deepFind(n.shadowRoot); if (r) return r; }
-                }
-                return null;
-            }
-            var el2 = deepFind(document);
-            if (el2) {
-                el2.scrollIntoView({block: 'center'});
-                el2.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                el2.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
-                el2.click();
-                return 'shadow';
-            }
-            var hits = Array.from(document.querySelectorAll(
-                'a, button, input[type=button], input[type=submit]'
-            ));
-            for (var c of hits) {
-                if ((c.textContent || c.value || '').trim().toLowerCase() === 'save') {
-                    c.scrollIntoView({block: 'center'});
-                    c.click();
-                    return 'text';
-                }
-            }
-            return 'not_found';
-        """)
-        if save_result == 'not_found':
-            raise RuntimeError(
-                f"Could not find Save button (#{_SAVE}) — tried getElementById, "
-                "shadow DOM search, and text search."
+        # Fall back to the outer button element
+        try:
+            save_btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.ID, _SAVE))
             )
-        save_method = save_result
+            ActionChains(driver).click(save_btn).perform()
+            save_method = 'button'
+        except (TimeoutException, NoSuchElementException,
+                StaleElementReferenceException, ElementNotInteractableException):
+            pass
+
+    if save_method is None:
+        raise RuntimeError(
+            f"Could not find or click the Save button (#{_SAVE} span). "
+            f"URL: {driver.current_url}"
+        )
 
     log(f"  [INFO] Save clicked (method: {save_method}).")
     if capture_logs:
