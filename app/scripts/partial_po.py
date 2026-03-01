@@ -42,9 +42,11 @@ _ROW0_CELL = '#POResults_DXDataRow0 > td:nth-of-type(3)'
 _SAVE      = 'EditFormButton_CD'
 _WAIT      = 15
 
-# Matches ANY open DX inline editor regardless of column index
-# DevExpress IDs: POProducts_DXEditor{col}_I
-_EDITOR_SEL = '[id^="POProducts_DXEditor"][id$="_I"]'
+# Both Chrome Recorder recordings show the ORDERED editor is always column 13:
+#   #POProducts_DXEditor13_I
+# The fallback selector matches ANY open DX editor in case the index shifts.
+_EDITOR_ID  = 'POProducts_DXEditor13_I'
+_EDITOR_SEL = f'#{_EDITOR_ID}, [id^="POProducts_DXEditor"][id$="_I"]'
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -222,26 +224,29 @@ def _read_row_values(driver, row_id, ordered_idx, shipped_idx):
 
 def _set_editor_value(driver, value, log, row_label):
     """
-    Type a value into the currently open DevExpress inline editor, then
-    commit it by clicking div.contentArea — exactly what the Chrome Recorder
-    shows a human doing.
+    Type a value into the open DevExpress inline editor and commit with Enter.
 
-    Flow:
-      1. Wait for the editor input (id starts with POProducts_DXEditor, ends _I)
-      2. JS-focus it so WebDriver can address it via switch_to.active_element
-      3. Ctrl+A → type new value (trusted keyboard events)
-      4. Click div.contentArea to blur → DevExpress fires change handler
+    Chrome Recorder recording 2 shows:
+      1. Click cell → editor opens (#POProducts_DXEditor13_I)
+      2. Set value in editor
+      3. Press Enter (x2 in recording) to commit
+      4. Click Save span
+
+    Flow here:
+      1. Wait for the editor input to appear
+      2. JS-focus it so switch_to.active_element finds it
+      3. Ctrl+A + type value (trusted keyboard events via active element)
+      4. Send Enter to commit — DevExpress closes the editor and saves the value
     """
     wait = WebDriverWait(driver, _WAIT)
 
-    # Wait for the editor input to appear in the DOM
     try:
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, _EDITOR_SEL)))
     except TimeoutException:
         log(f"  [WARN] {row_label}: no editor appeared after {_WAIT}s")
         return False
 
-    # Focus the editor via JS so switch_to.active_element finds it reliably
+    # JS-focus so switch_to.active_element reliably returns this input
     driver.execute_script("""
         var ed = document.querySelector(arguments[0]);
         if (ed) { ed.focus(); ed.select(); }
@@ -252,22 +257,17 @@ def _set_editor_value(driver, value, log, row_label):
     active_id = active.get_attribute('id') or '(no id)'
     log(f"  [DIAG] {row_label}: active element id='{active_id}'")
 
-    active.send_keys(Keys.CONTROL + 'a')  # select all
+    active.send_keys(Keys.CONTROL + 'a')  # select all existing text
     active.send_keys(str(value))           # type new value
 
-    # Chrome Recorder commits the edit by clicking somewhere else on the page
-    # (div.contentArea at y≈1353), NOT by pressing TAB.  This is what triggers
-    # DevExpress's blur/change handler and persists the value.
-    try:
-        content_area = driver.find_element(By.CSS_SELECTOR, 'div.contentArea')
-        ActionChains(driver).click(content_area).perform()
-        log(f"  [DIAG] {row_label}: committed by clicking div.contentArea")
-    except (NoSuchElementException, ElementNotInteractableException):
-        # If contentArea is not found, fall back to TAB
-        ActionChains(driver).send_keys(Keys.TAB).perform()
-        log(f"  [DIAG] {row_label}: committed by TAB (contentArea not found)")
+    # Commit with Enter — Chrome Recorder recording 2 shows Enter pressed
+    # (twice) after changing the value.  Enter commits the inline edit in
+    # DevExpress; the second press in the recording is likely just the user
+    # confirming.  One Enter is sufficient to close the editor and persist.
+    active.send_keys(Keys.RETURN)
+    time.sleep(0.2)
 
-    time.sleep(0.1)
+    log(f"  [DIAG] {row_label}: committed via Enter")
     return True
 
 
@@ -401,18 +401,18 @@ def _partial_single_po(driver, log, po,
         log(f"  [INFO] All rows already match — nothing to save.")
         return
 
-    # ── Pass 2: click each cell, type the value, click away to commit ──────
-    # Based on the Chrome Recorder recording of a human making this edit:
-    #   • Click div.dxgBCTC inside the td  (NOT the td itself)
-    #   • Type the new value via the editor input
-    #   • Click div.contentArea to blur/commit  (NOT TAB)
+    # ── Pass 2: click each cell, type the value, commit with Enter ────────
+    # Matches Chrome Recorder recording 2 exactly:
+    #   1. Click td:nth-of-type(15) [div.dxgBCTC preferred, td as fallback]
+    #   2. Wait for #POProducts_DXEditor13_I to appear
+    #   3. Ctrl+A → type new value → press Enter to commit
     changes = 0
     for row_n, row_id, shipped_text in rows_to_edit:
         label = f"Row {row_n+1}"
 
         clicked = _click_cell(driver, row_id, ordered_idx)
         if not clicked:
-            log(f"  [WARN] {label}: could not click ORDERED cell — skipping")
+            log(f"  [WARN] {label}: could not click ORDERED cell (td[{ordered_idx}]) — skipping")
             continue
 
         time.sleep(0.4)
@@ -421,12 +421,20 @@ def _partial_single_po(driver, log, po,
         if editors_now:
             log(f"  [DIAG] {label}: editor OPEN — id={editors_now[0].get_attribute('id')}")
         else:
-            log(f"  [DIAG] {label}: editor NOT OPEN after click")
+            log(f"  [DIAG] {label}: editor NOT OPEN after click — cell may be wrong td index")
 
         ok = _set_editor_value(driver, shipped_text, log, label)
         if ok:
             changes += 1
+
+        # Verify the cell text updated after Enter-commit
         time.sleep(0.3)
+        try:
+            row_el = driver.find_element(By.ID, row_id)
+            new_val = row_el.find_elements(By.TAG_NAME, 'td')[ordered_idx].text.strip()
+            log(f"  [DIAG] {label}: td[{ordered_idx}] value after commit = '{new_val}'")
+        except Exception:
+            pass
 
     if capture_logs:
         _dump_browser_logs(driver, log, 'after all edits')
