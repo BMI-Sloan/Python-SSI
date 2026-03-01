@@ -424,6 +424,10 @@
       <div class="section-label">PO Numbers <span style="color:var(--muted)">(one per line)</span></div>
       <textarea id="poInput" placeholder="Enter PO numbers, one per line&#10;e.g.&#10;123456789&#10;9876543210" rows="6"></textarea>
       <div style="font-size:11px; color:var(--muted); margin-top:4px">Numbers under 10 digits are padded with leading zeros automatically.</div>
+      <label style="display:flex; align-items:center; gap:6px; margin-top:10px; font-size:12px; cursor:pointer; color:var(--fg);">
+        <input type="checkbox" id="showBrowserCheck">
+        Show browser window (debug mode)
+      </label>
     </div>
 
     <!-- Excel upload -->
@@ -1002,6 +1006,9 @@ document.getElementById('btnRun').addEventListener('click', async () => {
       .filter(Boolean)
       .map(n => n.replace(/\D/g, '').padStart(10, '0'));
     paramsObj.po_numbers = poList;
+    if (document.getElementById('showBrowserCheck').checked) {
+      paramsObj.show_browser = true;
+    }
   }
 
   const paramsStr = JSON.stringify(paramsObj);

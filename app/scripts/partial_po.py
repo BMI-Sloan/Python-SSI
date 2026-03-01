@@ -104,23 +104,31 @@ def _discover_columns(driver, log):
                          .trim()
                          .toUpperCase();
             out.headers.push(i + ':' + t);
-            if (t === 'ORDERED')       out.ordered = i;
-            else if (t === 'SHIPPED')  out.shipped = i;
+            // Use contains-match so "Qty Ordered", "Order Qty", etc. are found
+            if (out.ordered < 0 && t.indexOf('ORDER') >= 0) out.ordered = i;
+            else if (out.shipped < 0 && t.indexOf('SHIP') >= 0) out.shipped = i;
         }
         return out;
     """)
 
     if result:
-        log(f"  [DIAG] Grid headers: {' | '.join(result.get('headers', []))}")
+        all_headers = ' | '.join(result.get('headers', []))
+        log(f"  [DIAG] Grid headers: {all_headers}")
         o = result.get('ordered', -1)
         s = result.get('shipped', -1)
         if o >= 0 and s >= 0:
             log(f"  [INFO] Column indices — ORDERED: td[{o}], SHIPPED: td[{s}]")
             return o, s
+        raise RuntimeError(
+            f"Could not find ORDERED/SHIPPED columns. "
+            f"ORDERED={'td['+str(o)+']' if o>=0 else 'NOT FOUND'}, "
+            f"SHIPPED={'td['+str(s)+']' if s>=0 else 'NOT FOUND'}. "
+            f"Headers: {all_headers}"
+        )
 
     raise RuntimeError(
-        "Could not find ORDERED and SHIPPED headers in POProducts grid. "
-        f"Discovery returned: {result}"
+        "POProducts_DXHeadersRow0 not found on the page. "
+        f"URL: {driver.current_url}"
     )
 
 
