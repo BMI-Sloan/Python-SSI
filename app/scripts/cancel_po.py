@@ -146,41 +146,75 @@ def _cancel_single_po(driver, log, po, first):
             "the element still has id='CancelPo_S_D'."
         )
 
+    def _cb_state():
+        """
+        Return True if the CancelPo checkbox is checked, False if unchecked,
+        None if indeterminate/not found.
+
+        Check order:
+          1. DevExpress API  ctrl.GetChecked()
+          2. Hidden input    input[name='CancelPo'].value === 'true'
+          3. CSS class       dxICheckBoxChecked but NOT dxICheckBoxUnchecked
+             (BUG TRAP: 'Checked' is a substring of 'Unchecked' — always
+              exclude the Unchecked case explicitly)
+        """
+        return driver.execute_script("""
+            // 1. DevExpress API
+            try {
+                var ctrl = ASPxClientControl.GetControlCollection()
+                                            .GetByName('CancelPo');
+                if (ctrl && typeof ctrl.GetChecked === 'function')
+                    return ctrl.GetChecked();
+            } catch(e) {}
+
+            // 2. Hidden input value (most reliable DOM fallback)
+            var inp = document.querySelector('input[name="CancelPo"]');
+            if (inp) return inp.value === 'true' || inp.value === 'True';
+
+            // 3. CSS class — MUST exclude 'Unchecked' because 'Checked' is
+            //    a substring of 'Unchecked' and would produce a false positive.
+            var el = document.getElementById('CancelPo_S_D');
+            if (!el) return null;
+            var cls = el.className || '';
+            var isUnchecked = cls.indexOf('Unchecked') >= 0 ||
+                              cls.indexOf('unchecked') >= 0;
+            var hasChecked  = cls.indexOf('Checked')   >= 0 ||
+                              cls.indexOf('checked')   >= 0;
+            return hasChecked && !isUnchecked;
+        """)
+
+    # Log the element's CSS class before clicking so we can see the
+    # before/after state in the logs if verification ever fails again.
+    pre_cls = driver.execute_script(
+        "var e=document.getElementById('CancelPo_S_D');"
+        "return e ? e.className : 'not found'"
+    )
+    log(f"  [DIAG] CancelPo_S_D class before click: {pre_cls}")
+
     driver.execute_script("arguments[0].scrollIntoView({block:'center'})", cb)
     time.sleep(0.2)
     ActionChains(driver).click(cb).perform()
     time.sleep(0.5)
 
-    # Verify the checkbox is now checked
-    is_checked = driver.execute_script("""
-        try {
-            var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
-            if (ctrl && typeof ctrl.GetChecked === 'function') return ctrl.GetChecked();
-        } catch(e) {}
-        var el = document.getElementById('CancelPo_S_D');
-        if (!el) return null;
-        var cls = el.className || '';
-        return cls.indexOf('Checked') >= 0 || cls.indexOf('checked') >= 0;
-    """)
+    is_checked = _cb_state()
+    post_cls = driver.execute_script(
+        "var e=document.getElementById('CancelPo_S_D');"
+        "return e ? e.className : 'not found'"
+    )
+    log(f"  [DIAG] CancelPo_S_D class after click:  {post_cls}  →  checked={is_checked}")
 
-    if is_checked is False:
-        # One retry — sometimes DevExpress needs a second click to register
+    if not is_checked:
+        # One retry — sometimes DevExpress needs a second click
+        log(f"  [INFO] Checkbox not yet checked — retrying click…")
         ActionChains(driver).click(cb).perform()
         time.sleep(0.5)
-        is_checked = driver.execute_script("""
-            try {
-                var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
-                if (ctrl && typeof ctrl.GetChecked === 'function') return ctrl.GetChecked();
-            } catch(e) {}
-            var el = document.getElementById('CancelPo_S_D');
-            if (!el) return null;
-            var cls = el.className || '';
-            return cls.indexOf('Checked') >= 0 || cls.indexOf('checked') >= 0;
-        """)
+        is_checked = _cb_state()
+        log(f"  [DIAG] checked after retry: {is_checked}")
 
-    if is_checked is False:
+    if not is_checked:
         raise RuntimeError(
-            "Clicked #CancelPo_S_D twice but checkbox is still unchecked. "
+            f"Clicked #CancelPo_S_D twice but checkbox is still unchecked "
+            f"(class='{post_cls}'). "
             "The DevExpress control may require a different interaction."
         )
 
