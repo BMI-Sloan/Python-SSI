@@ -237,11 +237,17 @@ def _read_row_values(driver, row_id):
         return None, None
 
 
-def _set_editor_value(driver, value, log, row_label):
+def _set_editor_value(driver, value, log, row_label, row_n):
     """
     Type a value into the open DevExpress inline editor and commit it.
     Returns True only if the editor actually CLOSED (commit confirmed).
     Returns False if the editor is still open after all attempts.
+
+    IMPORTANT — row edit mode:
+    DevExpress opens ALL cells in a row for editing when any cell is clicked.
+    _EDITOR_SEL would find the first editor in DOM order (DXEditor8_I =
+    CANCEL BY DATE), NOT the ORDERED column's editor.  We instead look for
+    the <input> that DevExpress renders INSIDE the specific ORDERED td.
 
     Commit strategy:
       1. DevExpress JS API: POProducts.UpdateEdit() — direct API call, no
@@ -253,18 +259,42 @@ def _set_editor_value(driver, value, log, row_label):
     """
     wait = WebDriverWait(driver, _WAIT)
 
+    # Wait for ANY editor to appear first (confirms row is in edit mode),
+    # then find the input INSIDE the ORDERED td specifically.
     try:
-        editor = wait.until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, _EDITOR_SEL))
-        )
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, _EDITOR_SEL)))
     except TimeoutException:
         log(f"  [WARN] {row_label}: no editor appeared after {_WAIT}s")
         return False
 
-    editor_id = editor.get_attribute('id') or '(no id)'
-    log(f"  [DIAG] {row_label}: editor id='{editor_id}'")
+    # DevExpress row-edit mode: each td's input is rendered inside that td.
+    ordered_td_css = (
+        f'#POProducts_DXDataRow{row_n} > td:nth-of-type({_ORDERED_COL + 1})'
+    )
+    editor = None
+    try:
+        ordered_td = driver.find_element(By.CSS_SELECTOR, ordered_td_css)
+        inputs = ordered_td.find_elements(By.TAG_NAME, 'input')
+        if inputs:
+            editor = inputs[0]
+            log(f"  [DIAG] {row_label}: editor found inside ORDERED td — id='{editor.get_attribute('id') or '(no id)'}'")
+        else:
+            log(f"  [DIAG] {row_label}: no <input> inside ORDERED td — falling back to first editor")
+    except NoSuchElementException:
+        log(f"  [DIAG] {row_label}: ORDERED td not found — falling back to first editor")
 
-    # Click editor for trusted focus, then clear + type
+    if editor is None:
+        # Fallback: global selector (may be wrong column — logged above)
+        try:
+            editor = wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, _EDITOR_SEL))
+            )
+            log(f"  [DIAG] {row_label}: fallback editor id='{editor.get_attribute('id') or '(no id)'}'")
+        except TimeoutException:
+            log(f"  [WARN] {row_label}: fallback editor also not found")
+            return False
+
+    # Click to ensure this specific editor has focus
     ActionChains(driver).click(editor).perform()
     time.sleep(0.15)
 
@@ -272,6 +302,10 @@ def _set_editor_value(driver, value, log, row_label):
         "return (document.activeElement && document.activeElement.id) || '(no id)'"
     )
     log(f"  [DIAG] {row_label}: active element after click = '{active_id}'")
+
+    # Log original value before overwriting
+    original_val = editor.get_attribute('value') or ''
+    log(f"  [DIAG] {row_label}: editor original value = '{original_val}'")
 
     editor.send_keys(Keys.CONTROL + 'a')
     editor.send_keys(str(value))
@@ -531,7 +565,7 @@ def _partial_single_po(driver, log, po,
             failed_rows.append(label)
             continue
 
-        committed = _set_editor_value(driver, shipped_text, log, label)
+        committed = _set_editor_value(driver, shipped_text, log, label, row_n)
 
         # Verify cell value changed (empty = editor still open)
         time.sleep(0.3)

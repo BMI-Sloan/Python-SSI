@@ -20,7 +20,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
 from utils.browser import make_driver
 
@@ -90,7 +91,20 @@ def _cancel_single_po(driver, log, po, first):
         raise RuntimeError(f"PO {po} did not appear in results after {_WAIT}s.")
 
     log(f"  [INFO] Found result — opening PO detail…")
-    row_cell.click()
+    # DevExpress re-renders the results grid after the search, which can
+    # make the element stale between find and click.  Retry up to 3 times.
+    for attempt in range(3):
+        try:
+            row_cell = driver.find_element(By.CSS_SELECTOR, _ROW0_CELL)
+            ActionChains(driver).click(row_cell).perform()
+            break
+        except StaleElementReferenceException:
+            if attempt == 2:
+                raise RuntimeError(
+                    f"Result row for PO {po} went stale 3 times — "
+                    "DevExpress grid re-rendered unexpectedly."
+                )
+            time.sleep(0.3)
 
     # ── Wait for /PO/Edit/ page ───────────────────────────────────────────
     try:
