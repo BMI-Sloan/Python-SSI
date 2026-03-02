@@ -45,7 +45,14 @@ _WAIT      = 15
 # All three Chrome Recorder recordings confirm the ORDERED column is always
 # td:nth-of-type(15) — that is index 14 (0-based) among direct-child tds.
 # The editor that opens is always #POProducts_DXEditor13_I.
-_ORDERED_COL = 14   # 0-based direct-child td index; CSS nth-of-type is 1-based so +1 = 15
+#
+# The header row (POProducts_DXHeadersRow0) has 3 header tds per data column
+# (name td, name td, blank td) so header indices ≠ data-row indices.
+# SHIPPED is always the column immediately after ORDERED:
+#   header ORDERED at td[40] → data td[14]   (confirmed by all recordings)
+#   header SHIPPED at td[43] → data td[15]   (right after ORDERED)
+_ORDERED_COL = 14   # 0-based direct-child td index; CSS nth-of-type is 1-based → 15
+_SHIPPED_COL = 15   # always ORDERED + 1
 _EDITOR_SEL  = '#POProducts_DXEditor13_I, [id^="POProducts_DXEditor"][id$="_I"]'
 
 
@@ -202,23 +209,27 @@ def _discover_columns(driver, log):
     )
 
 
-def _read_row_values(driver, row_id, shipped_idx):
+def _read_row_values(driver, row_id):
     """
     Return (ordered_text, shipped_text) or (None, None) on error.
-    The site leaves SHIPPED blank instead of '0' when nothing was shipped —
-    normalise blank to '0' so the comparison works correctly.
 
-    Uses XPath './td' (direct children only) so the index matches CSS
-    > td:nth-of-type which also counts direct children.
+    Uses hardcoded _ORDERED_COL=14 and _SHIPPED_COL=15 — both confirmed
+    by data-row DIAG:  td[14]=ORDERED, td[15]=SHIPPED, td[16]=OPEN.
+
+    The header row has 3 tds per data column so header indices cannot be
+    used directly; both data-column indices are hardcoded here.
+
+    Uses XPath './td' (direct children only) so counts match CSS `> td`.
+    The site shows SHIPPED as blank (not '0') when nothing shipped —
+    normalised to '0' for comparison.
     """
     try:
         row_el = driver.find_element(By.ID, row_id)
-        # Direct children only — same count as CSS `> td:nth-of-type`
         cells  = row_el.find_elements(By.XPATH, './td')
-        if len(cells) <= max(_ORDERED_COL, shipped_idx):
+        if len(cells) <= _SHIPPED_COL:
             return None, None
         ordered = cells[_ORDERED_COL].text.strip()
-        shipped = cells[shipped_idx].text.strip() or '0'
+        shipped = cells[_SHIPPED_COL].text.strip() or '0'
         return ordered, shipped
     except (NoSuchElementException, StaleElementReferenceException):
         return None, None
@@ -352,19 +363,17 @@ def _partial_single_po(driver, log, po,
         log(f"  [INFO] No product rows found — nothing to adjust.")
         return
 
-    # ── Discover SHIPPED column index from header ──────────────────────────
-    # ORDERED is always td[14] (hardcoded, confirmed by all Chrome Recorder
-    # recordings).  We still discover SHIPPED dynamically since we need it
-    # to read and compare values.
+    # ── Log headers for diagnostics (not used for indexing) ───────────────
+    # The header row has 3 tds per data column so its indices ≠ data indices.
+    # We log it purely so the DIAG output can confirm which columns exist.
     try:
-        _, shipped_idx = _discover_columns(driver, log)
+        _discover_columns(driver, log)
     except RuntimeError as e:
-        log(f"  [WARN] Column discovery failed ({e}) — using fallback shipped_idx=15")
-        shipped_idx = _ORDERED_COL + 1  # fallback: SHIPPED is right after ORDERED
+        log(f"  [WARN] Header scan: {e}")
     if capture_logs:
-        _dump_browser_logs(driver, log, 'after column discovery')
+        _dump_browser_logs(driver, log, 'after header scan')
 
-    # ── Diagnostic: show direct-child td values around the ORDERED column ──
+    # ── Diagnostic: confirm data-row values at the hardcoded indices ───────
     try:
         diag = driver.execute_script("""
             var row = document.getElementById('POProducts_DXDataRow0');
@@ -377,7 +386,8 @@ def _partial_single_po(driver, log, po,
             return out.join(' | ');
         """)
         if diag:
-            log(f"  [DIAG] Row 0 direct-child tds[12-17]: {diag}")
+            log(f"  [DIAG] Row 0 data tds[12-17]: {diag}")
+        log(f"  [INFO] Using hardcoded ORDERED=td[{_ORDERED_COL}], SHIPPED=td[{_SHIPPED_COL}]")
     except Exception:
         pass
 
@@ -387,7 +397,7 @@ def _partial_single_po(driver, log, po,
 
     while True:
         row_id = f'POProducts_DXDataRow{row_n}'
-        ordered, shipped = _read_row_values(driver, row_id, shipped_idx)
+        ordered, shipped = _read_row_values(driver, row_id)
 
         if ordered is None and shipped is None:
             if not driver.find_elements(By.ID, row_id):
