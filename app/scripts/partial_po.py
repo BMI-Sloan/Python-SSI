@@ -240,18 +240,16 @@ def _read_row_values(driver, row_id):
 def _set_editor_value(driver, value, log, row_label):
     """
     Type a value into the open DevExpress inline editor and commit it.
+    Returns True only if the editor actually CLOSED (commit confirmed).
+    Returns False if the editor is still open after all attempts.
 
-    The commit step is critical: pressing Enter on the input element does NOT
-    close the editor — DevExpress listens for Enter at the document/grid level,
-    not on the input itself.  cell.text = '' after Enter means the editor is
-    still open (the <input> is still inside the <td>).
-
-    Commit strategy (in order):
-      1. Click div.contentArea (page background) — triggers blur on the input
-         which is what DevExpress uses to fire its change/commit handler.
-         (This is what Chrome Recorder recording 1 shows.)
-      2. If editor still open: ActionChains Enter x2 (recordings 2 & 3).
-      3. If still open: Tab key.
+    Commit strategy:
+      1. DevExpress JS API: POProducts.UpdateEdit() — direct API call, no
+         event handling needed, bypasses isTrusted restrictions entirely.
+      2. Enter key sent directly to the editor element.
+      3. Click the grid's header row (blur trigger within DevExpress scope).
+      4. JS document.activeElement.blur() (force blur).
+      5. Tab key sent directly to the editor element.
     """
     wait = WebDriverWait(driver, _WAIT)
 
@@ -266,50 +264,105 @@ def _set_editor_value(driver, value, log, row_label):
     editor_id = editor.get_attribute('id') or '(no id)'
     log(f"  [DIAG] {row_label}: editor id='{editor_id}'")
 
-    # Click editor for trusted focus
+    # Click editor for trusted focus, then clear + type
     ActionChains(driver).click(editor).perform()
-    time.sleep(0.1)
+    time.sleep(0.15)
 
-    # Select all existing text and type the new value
-    editor.send_keys(Keys.CONTROL + 'a')
+    active_id = driver.execute_script(
+        "return (document.activeElement && document.activeElement.id) || '(no id)'"
+    )
+    log(f"  [DIAG] {row_label}: active element after click = '{active_id}'")
+
+    editor.clear()
     editor.send_keys(str(value))
-    time.sleep(0.1)
+    time.sleep(0.15)
 
-    # ── Commit attempt 1: click div.contentArea (blur trigger) ─────────────
-    # Recording 1 commits this way. Clicking outside the grid blurs the editor
-    # which fires DevExpress's change handler and persists the value.
-    commit_method = None
+    def editor_closed():
+        return not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
+
+    # ── Commit attempt 1: DevExpress JS API (UpdateEdit) ──────────────────
+    # Calls DevExpress's own client-side method to end editing and save the
+    # value.  Does not rely on keyboard/mouse events, so isTrusted is moot.
     try:
-        content_area = driver.find_element(By.CSS_SELECTOR, 'div.contentArea')
-        ActionChains(driver).click(content_area).perform()
+        api_result = driver.execute_script("""
+            if (window.POProducts &&
+                    typeof window.POProducts.UpdateEdit === 'function') {
+                window.POProducts.UpdateEdit();
+                return 'window.POProducts.UpdateEdit';
+            }
+            if (typeof ASPx !== 'undefined' && ASPx.GetControlCollection) {
+                var cc  = ASPx.GetControlCollection();
+                var g   = cc.GetByName ? cc.GetByName('POProducts') : null;
+                if (g && g.UpdateEdit) {
+                    g.UpdateEdit();
+                    return 'ASPx.UpdateEdit';
+                }
+            }
+            return null;
+        """)
+        time.sleep(0.5)
+        if editor_closed():
+            log(f"  [DIAG] {row_label}: typed '{value}' — committed via JS API ({api_result})")
+            return True
+        if api_result:
+            log(f"  [DIAG] {row_label}: JS API ({api_result}) called but editor still open")
+        else:
+            log(f"  [DIAG] {row_label}: JS API not found — POProducts.UpdateEdit unavailable")
+    except Exception as exc:
+        log(f"  [DIAG] {row_label}: JS API error: {exc}")
+
+    # ── Commit attempt 2: Enter directly on the editor element ────────────
+    try:
+        editor.send_keys(Keys.RETURN)
+        time.sleep(0.5)
+        if editor_closed():
+            log(f"  [DIAG] {row_label}: typed '{value}' — committed via editor Enter")
+            return True
+        log(f"  [DIAG] {row_label}: editor Enter did not close editor")
+    except StaleElementReferenceException:
         time.sleep(0.3)
-        if not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL):
-            commit_method = 'contentArea'
-    except (NoSuchElementException, Exception):
-        pass
+        if editor_closed():
+            log(f"  [DIAG] {row_label}: typed '{value}' — committed via editor Enter (stale)")
+            return True
 
-    # ── Commit attempt 2: ActionChains Enter x2 (recordings 2 & 3) ─────────
-    if commit_method is None:
-        ActionChains(driver).send_keys(Keys.RETURN).perform()
-        time.sleep(0.1)
-        ActionChains(driver).send_keys(Keys.RETURN).perform()
-        time.sleep(0.2)
-        if not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL):
-            commit_method = 'Enter x2'
+    # ── Commit attempt 3: click the grid header row (blur within grid) ────
+    try:
+        header = driver.find_element(By.ID, 'POProducts_DXHeadersRow0')
+        ActionChains(driver).click(header).perform()
+        time.sleep(0.5)
+        if editor_closed():
+            log(f"  [DIAG] {row_label}: typed '{value}' — committed via header-row click")
+            return True
+        log(f"  [DIAG] {row_label}: header-row click did not close editor")
+    except NoSuchElementException:
+        log(f"  [DIAG] {row_label}: POProducts_DXHeadersRow0 not found")
 
-    # ── Commit attempt 3: Tab key ────────────────────────────────────────
-    if commit_method is None:
-        ActionChains(driver).send_keys(Keys.TAB).perform()
-        time.sleep(0.2)
-        if not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL):
-            commit_method = 'Tab'
+    # ── Commit attempt 4: JS blur on active element ────────────────────────
+    driver.execute_script(
+        "if (document.activeElement) document.activeElement.blur();"
+    )
+    time.sleep(0.5)
+    if editor_closed():
+        log(f"  [DIAG] {row_label}: typed '{value}' — committed via JS blur")
+        return True
+    log(f"  [DIAG] {row_label}: JS blur did not close editor")
 
-    if commit_method:
-        log(f"  [DIAG] {row_label}: typed '{value}' — committed via {commit_method}")
-    else:
-        log(f"  [WARN] {row_label}: editor still open after all commit attempts")
+    # ── Commit attempt 5: Tab directly on the editor element ──────────────
+    try:
+        editor.send_keys(Keys.TAB)
+        time.sleep(0.5)
+        if editor_closed():
+            log(f"  [DIAG] {row_label}: typed '{value}' — committed via Tab")
+            return True
+        log(f"  [DIAG] {row_label}: Tab did not close editor")
+    except StaleElementReferenceException:
+        time.sleep(0.3)
+        if editor_closed():
+            log(f"  [DIAG] {row_label}: typed '{value}' — committed via Tab (stale)")
+            return True
 
-    return True
+    log(f"  [WARN] {row_label}: editor STILL OPEN after all 5 commit attempts — value NOT saved")
+    return False
 
 
 # ── core PO logic ─────────────────────────────────────────────────────────────
@@ -445,17 +498,19 @@ def _partial_single_po(driver, log, po,
         log(f"  [INFO] All rows already match — nothing to save.")
         return
 
-    # ── Pass 2: click td:nth-of-type(15), type value, commit with Enter ───
+    # ── Pass 2: click td:nth-of-type(15), type value, commit ─────────────
     # Uses the exact CSS selector from all three Chrome Recorder recordings:
     #   #POProducts_DXDataRowN > td:nth-of-type(15)
     # The `>` (direct child) is what makes the index reliable.
     changes = 0
+    failed_rows = []
     for row_n, row_id, shipped_text in rows_to_edit:
         label = f"Row {row_n+1}"
 
         clicked = _click_ordered_cell(driver, row_n)
         if not clicked:
             log(f"  [WARN] {label}: could not find/click #POProducts_DXDataRow{row_n} > td:nth-of-type({_ORDERED_COL + 1})")
+            failed_rows.append(label)
             continue
 
         time.sleep(0.4)
@@ -465,12 +520,12 @@ def _partial_single_po(driver, log, po,
             log(f"  [DIAG] {label}: editor OPEN — id={editors_now[0].get_attribute('id')}")
         else:
             log(f"  [DIAG] {label}: editor NOT OPEN — td:nth-of-type({_ORDERED_COL + 1}) may be wrong column")
+            failed_rows.append(label)
+            continue
 
-        ok = _set_editor_value(driver, shipped_text, log, label)
-        if ok:
-            changes += 1
+        committed = _set_editor_value(driver, shipped_text, log, label)
 
-        # Confirm the cell text changed after commit
+        # Verify cell value changed (empty = editor still open)
         time.sleep(0.3)
         try:
             new_val = driver.find_element(
@@ -478,15 +533,24 @@ def _partial_single_po(driver, log, po,
                 f'#POProducts_DXDataRow{row_n} > td:nth-of-type({_ORDERED_COL + 1})'
             ).text.strip()
             log(f"  [DIAG] {label}: cell value after commit = '{new_val}' (expected '{shipped_text}')")
+            if committed and new_val == shipped_text:
+                changes += 1
+            else:
+                log(f"  [WARN] {label}: commit did not change cell value — row NOT counted")
+                failed_rows.append(label)
         except Exception:
-            pass
+            if committed:
+                changes += 1  # can't verify but commit said it worked
 
     if capture_logs:
         _dump_browser_logs(driver, log, 'after all edits')
 
     if changes == 0:
-        log(f"  [INFO] No edits succeeded — skipping Save.")
-        return
+        raise RuntimeError(
+            f"Could not commit any edits — {len(failed_rows)} row(s) failed. "
+            "The editor refused to close after all commit attempts. "
+            "Check [DIAG] lines above for which commit method was attempted."
+        )
 
     # ── Click Save ─────────────────────────────────────────────────────────
     # Chrome Recorder: click the <span> inside #EditFormButton_CD, not the
@@ -538,6 +602,54 @@ def _partial_single_po(driver, log, po,
             f"or session expired. URL: {driver.current_url}"
         )
     log(f"  [INFO] Saved. URL: {driver.current_url}")
+
+    # ── Post-save verification ─────────────────────────────────────────────
+    # Re-open the PO and confirm every row that was supposed to change now
+    # shows ORDERED == SHIPPED.  A save that silently fails (e.g. validation
+    # error, editor still open) will show the old values here.
+    log(f"  [INFO] Re-opening PO to verify edits persisted…")
+    _go_to_po_list(driver)
+    try:
+        vsearch = WebDriverWait(driver, _WAIT).until(
+            EC.presence_of_element_located((By.ID, _SEARCH))
+        )
+        vsearch.clear()
+        vsearch.send_keys(po)
+        vsearch.send_keys(Keys.RETURN)
+        WebDriverWait(driver, _WAIT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, _ROW0_CELL))
+        )
+        row_cell = driver.find_element(By.CSS_SELECTOR, _ROW0_CELL)
+        ActionChains(driver).click(row_cell).perform()
+        WebDriverWait(driver, _WAIT).until(EC.url_contains('/PO/Edit/'))
+        WebDriverWait(driver, _WAIT).until(
+            EC.presence_of_element_located((By.ID, 'POProducts_DXHeadersRow0'))
+        )
+        time.sleep(0.5)
+
+        verify_failures = []
+        for row_n, row_id, expected_val in rows_to_edit:
+            ordered, shipped = _read_row_values(driver, row_id)
+            if ordered is None:
+                continue
+            if ordered == expected_val:
+                log(f"  [VERIFY] Row {row_n+1}: ORDERED={ordered} ✓")
+            else:
+                log(f"  [VERIFY] Row {row_n+1}: ORDERED={ordered} — expected {expected_val} ✗")
+                verify_failures.append(f"Row {row_n+1}")
+
+        if verify_failures:
+            raise RuntimeError(
+                f"Save appeared to succeed but {len(verify_failures)} row(s) "
+                f"still show wrong ORDERED value: {', '.join(verify_failures)}. "
+                "The value change was NOT persisted — editor may not have committed "
+                "before Save was clicked."
+            )
+        log(f"  [INFO] Verification passed — all {len(rows_to_edit)} edit(s) confirmed.")
+    except RuntimeError:
+        raise
+    except Exception as ve:
+        log(f"  [WARN] Verification step failed: {ve} — could not confirm edits")
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
