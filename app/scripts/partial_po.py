@@ -53,7 +53,9 @@ _WAIT      = 15
 #   header SHIPPED at td[43] → data td[15]   (right after ORDERED)
 _ORDERED_COL = 14   # 0-based direct-child td index; CSS nth-of-type is 1-based → 15
 _SHIPPED_COL = 15   # always ORDERED + 1
-_EDITOR_SEL  = '#POProducts_DXEditor13_I, [id^="POProducts_DXEditor"][id$="_I"]'
+# Dynamic selector — the editor column index varies per grid (e.g. DXEditor8_I,
+# DXEditor13_I), so we match any open editor by prefix/suffix pattern.
+_EDITOR_SEL  = '[id^="POProducts_DXEditor"][id$="_I"]'
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -239,48 +241,39 @@ def _set_editor_value(driver, value, log, row_label):
     """
     Type a value into the open DevExpress inline editor and commit with Enter.
 
-    Chrome Recorder recording 2 shows:
-      1. Click cell → editor opens (#POProducts_DXEditor13_I)
-      2. Set value in editor
-      3. Press Enter (x2 in recording) to commit
-      4. Click Save span
+    Previous approach (JS focus + switch_to.active_element) failed because
+    the active element after JS focus had no ID — focus landed on a wrapper,
+    not the input.
 
-    Flow here:
-      1. Wait for the editor input to appear
-      2. JS-focus it so switch_to.active_element finds it
-      3. Ctrl+A + type value (trusted keyboard events via active element)
-      4. Send Enter to commit — DevExpress closes the editor and saves the value
+    Fix: find the editor element, ActionChains-click it for trusted focus,
+    then send_keys() directly on that element reference.  No JS focus, no
+    switch_to.active_element.
     """
     wait = WebDriverWait(driver, _WAIT)
 
     try:
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, _EDITOR_SEL)))
+        editor = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, _EDITOR_SEL))
+        )
     except TimeoutException:
         log(f"  [WARN] {row_label}: no editor appeared after {_WAIT}s")
         return False
 
-    # JS-focus so switch_to.active_element reliably returns this input
-    driver.execute_script("""
-        var ed = document.querySelector(arguments[0]);
-        if (ed) { ed.focus(); ed.select(); }
-    """, _EDITOR_SEL)
+    editor_id = editor.get_attribute('id') or '(no id)'
+    log(f"  [DIAG] {row_label}: editor id='{editor_id}'")
+
+    # ActionChains click gives the editor trusted mouse focus (same as a human
+    # clicking the input after the cell was opened).
+    ActionChains(driver).click(editor).perform()
     time.sleep(0.1)
 
-    active    = driver.switch_to.active_element
-    active_id = active.get_attribute('id') or '(no id)'
-    log(f"  [DIAG] {row_label}: active element id='{active_id}'")
-
-    active.send_keys(Keys.CONTROL + 'a')  # select all existing text
-    active.send_keys(str(value))           # type new value
-
-    # Commit with Enter — Chrome Recorder recording 2 shows Enter pressed
-    # (twice) after changing the value.  Enter commits the inline edit in
-    # DevExpress; the second press in the recording is likely just the user
-    # confirming.  One Enter is sufficient to close the editor and persist.
-    active.send_keys(Keys.RETURN)
+    # Send keys directly to the editor element — no switch_to needed.
+    editor.send_keys(Keys.CONTROL + 'a')  # select all existing text
+    editor.send_keys(str(value))           # type new value
+    editor.send_keys(Keys.RETURN)          # commit (Chrome Recorder shows Enter)
     time.sleep(0.2)
 
-    log(f"  [DIAG] {row_label}: committed via Enter")
+    log(f"  [DIAG] {row_label}: typed '{value}' and committed via Enter")
     return True
 
 
