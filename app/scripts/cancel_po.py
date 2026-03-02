@@ -121,69 +121,71 @@ def _cancel_single_po(driver, log, po, first):
         raise RuntimeError(f"Form did not fully load (#{_SAVE} missing after {_WAIT}s).")
 
     # ── Step 5: tick the CANCEL PO checkbox ──────────────────────────────
-    # The recording used pierce/#CancelPo_S_D, which means the element may
-    # be inside a Shadow DOM. Selenium's standard find_element() cannot see
-    # into Shadow DOM, so we use three JavaScript strategies in order.
+    # Recording confirms selector: #CancelPo_S_D (the DevExpress checkbox
+    # visual element).  JavaScript el.click() dispatches an untrusted event
+    # that DevExpress ignores for state changes.  Use Selenium ActionChains
+    # for a trusted OS-level click, then verify the checkbox is checked.
     log(f"  [INFO] Setting CANCEL PO checkbox…")
 
-    result = driver.execute_script("""
-        // Strategy 1 — DevExpress JS API (works by name, no DOM search needed)
-        try {
-            var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
-            if (ctrl && typeof ctrl.SetChecked === 'function') {
-                if (!ctrl.GetChecked()) ctrl.SetChecked(true);
-                return 'api';
-            }
-        } catch(e) {}
+    cb = None
+    for sel in [
+        (By.ID,          'CancelPo_S_D'),
+        (By.CSS_SELECTOR,'#CancelPo_S_D'),
+        (By.XPATH,       '//*[@id="CancelPo_S_D"]'),
+    ]:
+        try:
+            cb = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(sel))
+            break
+        except TimeoutException:
+            continue
 
-        // Strategy 2 — regular getElementById (fast path for non-shadow DOM)
-        var el = document.getElementById('CancelPo_S_D');
-        if (el) { el.click(); return 'id'; }
-
-        // Strategy 3 — deep search through all shadow roots on the page
-        function deepFind(root) {
-            var found = root.querySelector ? root.querySelector('#CancelPo_S_D') : null;
-            if (found) return found;
-            var nodes = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
-            for (var n of nodes) {
-                if (n.shadowRoot) {
-                    var r = deepFind(n.shadowRoot);
-                    if (r) return r;
-                }
-            }
-            return null;
-        }
-        var el2 = deepFind(document);
-        if (el2) { el2.click(); return 'shadow'; }
-
-        // Strategy 4 — find any checkbox near a label whose text is "CANCEL PO"
-        var labels = Array.from(document.querySelectorAll('label, td, th, span, div'));
-        for (var l of labels) {
-            if (l.textContent.trim().toUpperCase() === 'CANCEL PO') {
-                var p = l.parentElement;
-                for (var i = 0; i < 5 && p && p !== document.body; i++) {
-                    var cb = p.querySelector(
-                        'input[type=checkbox], [role=checkbox], [class*=check]'
-                    );
-                    if (cb) { cb.click(); return 'label'; }
-                    p = p.parentElement;
-                }
-            }
-        }
-
-        return 'not_found';
-    """)
-
-    if result == 'not_found':
+    if cb is None:
         raise RuntimeError(
-            "Could not find the CANCEL PO checkbox via DevExpress API, "
-            "element ID, shadow DOM search, or label text. "
+            "Could not find #CancelPo_S_D on the page. "
             "Open the PO manually and use browser Inspect to confirm "
             "the element still has id='CancelPo_S_D'."
         )
 
-    log(f"  [INFO] CANCEL PO checkbox set (method: {result}).")
-    time.sleep(0.3)
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'})", cb)
+    time.sleep(0.2)
+    ActionChains(driver).click(cb).perform()
+    time.sleep(0.5)
+
+    # Verify the checkbox is now checked
+    is_checked = driver.execute_script("""
+        try {
+            var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
+            if (ctrl && typeof ctrl.GetChecked === 'function') return ctrl.GetChecked();
+        } catch(e) {}
+        var el = document.getElementById('CancelPo_S_D');
+        if (!el) return null;
+        var cls = el.className || '';
+        return cls.indexOf('Checked') >= 0 || cls.indexOf('checked') >= 0;
+    """)
+
+    if is_checked is False:
+        # One retry — sometimes DevExpress needs a second click to register
+        ActionChains(driver).click(cb).perform()
+        time.sleep(0.5)
+        is_checked = driver.execute_script("""
+            try {
+                var ctrl = ASPxClientControl.GetControlCollection().GetByName('CancelPo');
+                if (ctrl && typeof ctrl.GetChecked === 'function') return ctrl.GetChecked();
+            } catch(e) {}
+            var el = document.getElementById('CancelPo_S_D');
+            if (!el) return null;
+            var cls = el.className || '';
+            return cls.indexOf('Checked') >= 0 || cls.indexOf('checked') >= 0;
+        """)
+
+    if is_checked is False:
+        raise RuntimeError(
+            "Clicked #CancelPo_S_D twice but checkbox is still unchecked. "
+            "The DevExpress control may require a different interaction."
+        )
+
+    log(f"  [INFO] CANCEL PO checkbox confirmed checked.")
+    time.sleep(0.2)
 
     # ── Step 6: click Save ────────────────────────────────────────────────
     try:

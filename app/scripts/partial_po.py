@@ -597,18 +597,27 @@ def _partial_single_po(driver, log, po,
     # ── Click Save ─────────────────────────────────────────────────────────
     # Chrome Recorder: click the <span> inside #EditFormButton_CD, not the
     # outer div.  The span is the actual clickable label.
+    #
+    # NOTE: UpdateEdit() (commit attempt 1) sometimes triggers a full-page
+    # save and navigates to /PO automatically.  If that happened, the edit
+    # is already saved — skip the Save click and go straight to verification.
     log(f"  [INFO] {changes} row(s) updated — clicking Save…")
 
     save_method = None
-    try:
-        save_span = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, f'#{_SAVE} span'))
-        )
-        ActionChains(driver).click(save_span).perform()
-        save_method = 'span'
-    except (TimeoutException, NoSuchElementException,
-            StaleElementReferenceException, ElementNotInteractableException):
-        pass
+    if '/PO/Edit/' not in driver.current_url:
+        log(f"  [INFO] Page already at {driver.current_url} — save triggered automatically.")
+        save_method = 'auto'
+
+    if save_method is None:
+        try:
+            save_span = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, f'#{_SAVE} span'))
+            )
+            ActionChains(driver).click(save_span).perform()
+            save_method = 'span'
+        except (TimeoutException, NoSuchElementException,
+                StaleElementReferenceException, ElementNotInteractableException):
+            pass
 
     if save_method is None:
         # Fall back to the outer button element
@@ -632,17 +641,19 @@ def _partial_single_po(driver, log, po,
     if capture_logs:
         _dump_browser_logs(driver, log, 'after Save click')
 
-    # Verify save went through — page must navigate away from /PO/Edit/
-    try:
-        wait.until(lambda d: '/PO/Edit/' not in d.current_url)
-    except TimeoutException:
-        if capture_logs:
-            _dump_browser_logs(driver, log, 'save timeout — page did not navigate')
-        raise RuntimeError(
-            "Save was clicked but the page is still on the edit URL after "
-            f"{_WAIT}s. Possible causes: validation error, editor still open, "
-            f"or session expired. URL: {driver.current_url}"
-        )
+    # Verify save went through — page must navigate away from /PO/Edit/.
+    # Skip if auto-save already navigated before we got here.
+    if '/PO/Edit/' in driver.current_url:
+        try:
+            wait.until(lambda d: '/PO/Edit/' not in d.current_url)
+        except TimeoutException:
+            if capture_logs:
+                _dump_browser_logs(driver, log, 'save timeout — page did not navigate')
+            raise RuntimeError(
+                "Save was clicked but the page is still on the edit URL after "
+                f"{_WAIT}s. Possible causes: validation error, editor still open, "
+                f"or session expired. URL: {driver.current_url}"
+            )
     log(f"  [INFO] Saved. URL: {driver.current_url}")
 
     # ── Post-save verification ─────────────────────────────────────────────
