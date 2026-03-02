@@ -273,7 +273,7 @@ def _set_editor_value(driver, value, log, row_label):
     )
     log(f"  [DIAG] {row_label}: active element after click = '{active_id}'")
 
-    editor.clear()
+    editor.send_keys(Keys.CONTROL + 'a')
     editor.send_keys(str(value))
     time.sleep(0.15)
 
