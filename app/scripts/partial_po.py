@@ -277,12 +277,28 @@ def _set_editor_value(driver, value, log, row_label):
     editor.send_keys(str(value))
     time.sleep(0.15)
 
+    # Confirm what was actually typed into the input
+    try:
+        typed_val = editor.get_attribute('value') or ''
+        log(f"  [DIAG] {row_label}: input value after typing = '{typed_val}'")
+    except Exception:
+        pass
+
     def editor_closed():
         return not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL)
 
+    def poll_for_close(label, max_seconds=2.5):
+        """Poll up to max_seconds for the editor to disappear. Returns True if closed."""
+        deadline = time.time() + max_seconds
+        while time.time() < deadline:
+            if editor_closed():
+                return True
+            time.sleep(0.25)
+        return False
+
     # ── Commit attempt 1: DevExpress JS API (UpdateEdit) ──────────────────
-    # Calls DevExpress's own client-side method to end editing and save the
-    # value.  Does not rely on keyboard/mouse events, so isTrusted is moot.
+    # Calls DevExpress's own client-side API — no event handling, no
+    # isTrusted concern.  UpdateEdit() may be async, so poll for 2.5 s.
     try:
         api_result = driver.execute_script("""
             if (window.POProducts &&
@@ -300,37 +316,34 @@ def _set_editor_value(driver, value, log, row_label):
             }
             return null;
         """)
-        time.sleep(0.5)
-        if editor_closed():
+        if poll_for_close('JS API'):
             log(f"  [DIAG] {row_label}: typed '{value}' — committed via JS API ({api_result})")
             return True
         if api_result:
-            log(f"  [DIAG] {row_label}: JS API ({api_result}) called but editor still open")
+            log(f"  [DIAG] {row_label}: JS API ({api_result}) called — editor still open after 2.5s")
         else:
             log(f"  [DIAG] {row_label}: JS API not found — POProducts.UpdateEdit unavailable")
     except Exception as exc:
         log(f"  [DIAG] {row_label}: JS API error: {exc}")
 
     # ── Commit attempt 2: Enter directly on the editor element ────────────
+    # ElementNotInteractableException here often means DevExpress is in the
+    # middle of closing the editor (UpdateEdit started but isn't done yet).
+    # Treat it the same as stale — poll for closure.
     try:
         editor.send_keys(Keys.RETURN)
-        time.sleep(0.5)
-        if editor_closed():
-            log(f"  [DIAG] {row_label}: typed '{value}' — committed via editor Enter")
-            return True
-        log(f"  [DIAG] {row_label}: editor Enter did not close editor")
-    except StaleElementReferenceException:
-        time.sleep(0.3)
-        if editor_closed():
-            log(f"  [DIAG] {row_label}: typed '{value}' — committed via editor Enter (stale)")
-            return True
+    except (StaleElementReferenceException, ElementNotInteractableException) as exc:
+        log(f"  [DIAG] {row_label}: editor Enter → {type(exc).__name__} (may be mid-close)")
+    if poll_for_close('editor Enter'):
+        log(f"  [DIAG] {row_label}: typed '{value}' — committed via editor Enter")
+        return True
+    log(f"  [DIAG] {row_label}: editor Enter did not close editor")
 
     # ── Commit attempt 3: click the grid header row (blur within grid) ────
     try:
         header = driver.find_element(By.ID, 'POProducts_DXHeadersRow0')
         ActionChains(driver).click(header).perform()
-        time.sleep(0.5)
-        if editor_closed():
+        if poll_for_close('header click'):
             log(f"  [DIAG] {row_label}: typed '{value}' — committed via header-row click")
             return True
         log(f"  [DIAG] {row_label}: header-row click did not close editor")
@@ -341,8 +354,7 @@ def _set_editor_value(driver, value, log, row_label):
     driver.execute_script(
         "if (document.activeElement) document.activeElement.blur();"
     )
-    time.sleep(0.5)
-    if editor_closed():
+    if poll_for_close('JS blur'):
         log(f"  [DIAG] {row_label}: typed '{value}' — committed via JS blur")
         return True
     log(f"  [DIAG] {row_label}: JS blur did not close editor")
@@ -350,16 +362,12 @@ def _set_editor_value(driver, value, log, row_label):
     # ── Commit attempt 5: Tab directly on the editor element ──────────────
     try:
         editor.send_keys(Keys.TAB)
-        time.sleep(0.5)
-        if editor_closed():
-            log(f"  [DIAG] {row_label}: typed '{value}' — committed via Tab")
-            return True
-        log(f"  [DIAG] {row_label}: Tab did not close editor")
-    except StaleElementReferenceException:
-        time.sleep(0.3)
-        if editor_closed():
-            log(f"  [DIAG] {row_label}: typed '{value}' — committed via Tab (stale)")
-            return True
+    except (StaleElementReferenceException, ElementNotInteractableException) as exc:
+        log(f"  [DIAG] {row_label}: Tab → {type(exc).__name__} (may be mid-close)")
+    if poll_for_close('Tab'):
+        log(f"  [DIAG] {row_label}: typed '{value}' — committed via Tab")
+        return True
+    log(f"  [DIAG] {row_label}: Tab did not close editor")
 
     log(f"  [WARN] {row_label}: editor STILL OPEN after all 5 commit attempts — value NOT saved")
     return False
