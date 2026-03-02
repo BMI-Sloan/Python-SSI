@@ -239,15 +239,19 @@ def _read_row_values(driver, row_id):
 
 def _set_editor_value(driver, value, log, row_label):
     """
-    Type a value into the open DevExpress inline editor and commit with Enter.
+    Type a value into the open DevExpress inline editor and commit it.
 
-    Previous approach (JS focus + switch_to.active_element) failed because
-    the active element after JS focus had no ID — focus landed on a wrapper,
-    not the input.
+    The commit step is critical: pressing Enter on the input element does NOT
+    close the editor — DevExpress listens for Enter at the document/grid level,
+    not on the input itself.  cell.text = '' after Enter means the editor is
+    still open (the <input> is still inside the <td>).
 
-    Fix: find the editor element, ActionChains-click it for trusted focus,
-    then send_keys() directly on that element reference.  No JS focus, no
-    switch_to.active_element.
+    Commit strategy (in order):
+      1. Click div.contentArea (page background) — triggers blur on the input
+         which is what DevExpress uses to fire its change/commit handler.
+         (This is what Chrome Recorder recording 1 shows.)
+      2. If editor still open: ActionChains Enter x2 (recordings 2 & 3).
+      3. If still open: Tab key.
     """
     wait = WebDriverWait(driver, _WAIT)
 
@@ -262,18 +266,49 @@ def _set_editor_value(driver, value, log, row_label):
     editor_id = editor.get_attribute('id') or '(no id)'
     log(f"  [DIAG] {row_label}: editor id='{editor_id}'")
 
-    # ActionChains click gives the editor trusted mouse focus (same as a human
-    # clicking the input after the cell was opened).
+    # Click editor for trusted focus
     ActionChains(driver).click(editor).perform()
     time.sleep(0.1)
 
-    # Send keys directly to the editor element — no switch_to needed.
-    editor.send_keys(Keys.CONTROL + 'a')  # select all existing text
-    editor.send_keys(str(value))           # type new value
-    editor.send_keys(Keys.RETURN)          # commit (Chrome Recorder shows Enter)
-    time.sleep(0.2)
+    # Select all existing text and type the new value
+    editor.send_keys(Keys.CONTROL + 'a')
+    editor.send_keys(str(value))
+    time.sleep(0.1)
 
-    log(f"  [DIAG] {row_label}: typed '{value}' and committed via Enter")
+    # ── Commit attempt 1: click div.contentArea (blur trigger) ─────────────
+    # Recording 1 commits this way. Clicking outside the grid blurs the editor
+    # which fires DevExpress's change handler and persists the value.
+    commit_method = None
+    try:
+        content_area = driver.find_element(By.CSS_SELECTOR, 'div.contentArea')
+        ActionChains(driver).click(content_area).perform()
+        time.sleep(0.3)
+        if not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL):
+            commit_method = 'contentArea'
+    except (NoSuchElementException, Exception):
+        pass
+
+    # ── Commit attempt 2: ActionChains Enter x2 (recordings 2 & 3) ─────────
+    if commit_method is None:
+        ActionChains(driver).send_keys(Keys.RETURN).perform()
+        time.sleep(0.1)
+        ActionChains(driver).send_keys(Keys.RETURN).perform()
+        time.sleep(0.2)
+        if not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL):
+            commit_method = 'Enter x2'
+
+    # ── Commit attempt 3: Tab key ────────────────────────────────────────
+    if commit_method is None:
+        ActionChains(driver).send_keys(Keys.TAB).perform()
+        time.sleep(0.2)
+        if not driver.find_elements(By.CSS_SELECTOR, _EDITOR_SEL):
+            commit_method = 'Tab'
+
+    if commit_method:
+        log(f"  [DIAG] {row_label}: typed '{value}' — committed via {commit_method}")
+    else:
+        log(f"  [WARN] {row_label}: editor still open after all commit attempts")
+
     return True
 
 
